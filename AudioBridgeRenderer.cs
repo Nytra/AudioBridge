@@ -7,6 +7,10 @@ using CSCore;
 using CSCore.CoreAudioAPI;
 using CSCore.SoundOut;
 using Process = System.Diagnostics.Process;
+using InterprocessLib;
+using Renderite.Shared;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace AudioBridge.Renderer
 {
@@ -67,159 +71,106 @@ namespace AudioBridge.Renderer
     public class ShadowAudioPlayer
     {
         private WasapiOut _audioOut;
-        private ShadowBusReader _busReader;
-        private Thread _audioThread;
-        private bool _running;
-        
+        //private ShadowBusReader _busReader;
+        private const string MMF_NAME = "AudioBridge_SharedMemory";
+        //private Thread _audioThread;
+        //private bool _running;
+        private bool _stopped;
+        private Messenger _messenger;
+        private MuteTarget _lastMuteTarget;
+        private Task keepAlive;
+        private ShadowAudioSource _audioSource;
+    
         public void Start()
         {
-            _audioThread = new Thread(AudioThreadMain) { IsBackground = true };
-            _audioThread.Start();
-        }
-        
-        private void AudioThreadMain()
-        {
-            Debug.Log("[AudioBridge.Renderer] Audio thread starting - will monitor for audio sharing");
-            _running = true;
-            bool wasDisabled = false;
-            
-            while (_running)  // Main loop - keeps trying to connect
+            //_audioThread = new Thread(AudioThreadMain) { IsBackground = true };
+            //_audioThread.Start();
+            //AudioThreadMain();
+
+            Debug.Log("[AudioBridge.Renderer] Shadow audio player starting - will monitor for audio sharing");
+
+            // Initialize
+            _messenger = new(MMF_NAME, new List<Type>() { typeof(ShadowBusData) });
+
+            Debug.Log($"[AudioBridge.Renderer] Messenger created: {MMF_NAME}");
+
+            _messenger.ReceiveObject<ShadowBusData>("initData", (obj) =>
             {
-                try
+                if (_stopped) return;
+
+                var sampleRate = obj.sampleRate;
+                var channels = obj.channels;
+                string sessionId = obj.sessionId;
+                Debug.Log($"[AudioBridge.Renderer] Audio format: {sampleRate}Hz, {channels} channels");
+                Debug.Log($"[AudioBridge.Renderer] Using SessionID: {obj.sessionId ?? "none"}");
+
+                // Create audio source
+                _audioSource = new ShadowAudioSource(sampleRate, channels);
+
+                // Initialize audio output with SessionID if available
+                if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out Guid sessionGuid))
                 {
-                    // Initialize the shadow bus reader
-                    _busReader = new ShadowBusReader();
-                    
-                    // Try to connect to shared memory with better retry logic
-                    bool connected = false;
-                    for (int i = 0; i < 10 && !connected; i++)
-                    {
-                        if (_busReader.TryConnect())
-                        {
-                            connected = true;
-                            break;
-                        }
-                        Thread.Sleep(500);
-                    }
-                    
-                    if (!connected)
-                    {
-                        Debug.Log("[AudioBridge.Renderer] Shared memory not available, will retry...");
-                        _busReader.Dispose();
-                        _busReader = null;
-                        Thread.Sleep(2000);
-                        continue;
-                    }
-                    
-                    // Check if audio sharing is enabled
-                    if (!_busReader.IsEnabled())
-                    {
-                        Debug.Log("[AudioBridge.Renderer] Audio sharing is disabled, waiting for it to be enabled...");
-                        _busReader.Dispose();
-                        _busReader = null;
-                        Thread.Sleep(2000);
-                        continue;
-                    }
-                    
-                    Debug.Log("[AudioBridge.Renderer] Connected and audio sharing is enabled!");
-                    
-                    // Sync with the writer's current position by resetting read index to match write index
-                    _busReader.SyncWithWriter();
-                    
-                    var (sampleRate, channels) = _busReader.GetFormat();
-                    Debug.Log($"[AudioBridge.Renderer] Audio format: {sampleRate}Hz, {channels} channels");
-                    
-                    // Read SessionID from shared memory
-                    string sessionId = _busReader.GetSessionId();
-                    Debug.Log($"[AudioBridge.Renderer] Using SessionID: {sessionId ?? "none"}");
-                    
-                    // Create audio source
-                    var audioSource = new ShadowAudioSource(_busReader, sampleRate, channels);
-                    
-                    // Initialize audio output with SessionID if available
-                    if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out Guid sessionGuid))
-                    {
-                        // Use the same SessionID but with crossProcessSession: false to maintain separate control
-                        // This groups them in Windows but keeps them as separate audio sessions for muting
-                        _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20, sessionGuid, false);
-                        Debug.Log($"[AudioBridge.Renderer] Created WasapiOut with SessionID: {sessionGuid} (crossProcess: false for independent muting)");
-                    }
-                    else
-                    {
-                        // Fallback to default if no SessionID
-                        _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20);
-                        Debug.Log("[AudioBridge.Renderer] Created WasapiOut without SessionID (legacy mode)");
-                    }
-                    
-                    _audioOut.Initialize(audioSource.ToWaveSource());
-                    _audioOut.Play();
-                
+                    // Use the same SessionID but with crossProcessSession: false to maintain separate control
+                    // This groups them in Windows but keeps them as separate audio sessions for muting
+                    _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20, sessionGuid, false);
+                    Debug.Log($"[AudioBridge.Renderer] Created WasapiOut with SessionID: {sessionGuid} (crossProcess: false for independent muting)");
+                }
+                else
+                {
+                    // Fallback to default if no SessionID
+                    _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20);
+                    Debug.Log("[AudioBridge.Renderer] Created WasapiOut without SessionID (legacy mode)");
+                }
+
+                _audioOut.Initialize(_audioSource.ToWaveSource());
+                _audioOut.Play();
+
                 Debug.Log("[AudioBridge.Renderer] Audio playback started");
-                
-                // Check if we should mute based on configuration
-                var muteTarget = _busReader.GetMuteTarget();
+
+                MuteTarget muteTarget;
+                if (obj.muteTarget < 0 || obj.muteTarget > 2) muteTarget = MuteTarget.Renderer;
+                else
+                    muteTarget = (MuteTarget)obj.muteTarget;
+
                 Debug.Log($"[AudioBridge.Renderer] Mute target from host: {muteTarget}");
-                
+
                 if (muteTarget == MuteTarget.Renderer)
                 {
                     // Mute this process's audio session so we don't hear it locally
                     // but it will still be available for recording/streaming
                     MuteCurrentProcessAudio(_audioOut.Device);
                 }
-                _running = true;
+
+                // Keep alive and monitor
+                keepAlive ??= Task.Run(async () =>
+                {
+                    while (!_stopped)
+                    {
+                        await Task.Delay(5000);
+
+                        var playbackState = _audioOut?.PlaybackState ?? PlaybackState.Stopped;
+                        if (playbackState == PlaybackState.Stopped && !_stopped)
+                        {
+                            Debug.LogWarning("[AudioBridge.Renderer] Audio playback stopped, attempting restart");
+                            try
+                            {
+                                _audioOut?.Play();
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.LogError($"[AudioBridge.Renderer] Failed to restart playback: {ex.Message}");
+                            }
+                        }
+                    }
+                });
                 
-                // Keep thread alive and monitor
-                MuteTarget lastMuteTarget = muteTarget;
-                
-                while (_running)
+            });
+
+            _messenger.ReceiveValue<bool>("enabled", (val) =>
+            {
+                if (!val)
                 {
-                    Thread.Sleep(5000);
-                    
-                    // Check if audio sharing has been disabled
-                    if (!_busReader.IsEnabled())
-                    {
-                        Debug.Log("[AudioBridge.Renderer] Audio sharing disabled by host, stopping playback");
-                        wasDisabled = true;
-                        break;  // Break inner loop to clean up, but stay in outer loop to monitor for re-enable
-                    }
-                    
-                    // Check for mute configuration changes
-                    var currentMuteTarget = _busReader.GetMuteTarget();
-                    if (currentMuteTarget != lastMuteTarget)
-                    {
-                        Debug.Log($"[AudioBridge.Renderer] Mute target changed to: {currentMuteTarget}");
-                        if (currentMuteTarget == MuteTarget.Renderer)
-                        {
-                            MuteCurrentProcessAudio(_audioOut.Device);
-                        }
-                        else if (lastMuteTarget == MuteTarget.Renderer)
-                        {
-                            UnmuteCurrentProcessAudio(_audioOut.Device);
-                        }
-                        lastMuteTarget = currentMuteTarget;
-                    }
-                    
-                    var playbackState = _audioOut?.PlaybackState ?? PlaybackState.Stopped;
-                    if (playbackState == PlaybackState.Stopped && _running)
-                    {
-                        Debug.LogWarning("[AudioBridge.Renderer] Audio playback stopped, attempting restart");
-                        try
-                        {
-                            _audioOut?.Play();
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogError($"[AudioBridge.Renderer] Failed to restart playback: {ex.Message}");
-                        }
-                    }
-                }
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[AudioBridge.Renderer] Audio thread error: {ex}");
-                }
-                finally
-                {
+                    Debug.Log("[AudioBridge.Renderer] Audio sharing disabled by host, stopping playback");
                     // Clean up before potentially restarting
                     if (_audioOut != null)
                     {
@@ -228,42 +179,67 @@ namespace AudioBridge.Renderer
                         try { _audioOut.Dispose(); } catch { }
                         _audioOut = null;
                     }
-                    
-                    if (_busReader != null)
+                }
+            });
+
+            _messenger.ReceiveValue<int>("muteTarget", (val) =>
+            {
+                var muteTarget = (MuteTarget)val;
+                if (muteTarget != _lastMuteTarget)
+                {
+                    Debug.Log($"[AudioBridge.Renderer] Mute target changed to: {muteTarget}");
+                    if (muteTarget == MuteTarget.Renderer)
                     {
-                        try { _busReader.Dispose(); } catch { }
-                        _busReader = null;
+                        MuteCurrentProcessAudio(_audioOut.Device);
                     }
+                    else if (_lastMuteTarget == MuteTarget.Renderer)
+                    {
+                        UnmuteCurrentProcessAudio(_audioOut.Device);
+                    }
+                    _lastMuteTarget = muteTarget;
                 }
-                
-                // Check if we should exit or retry
-                if (!_running) 
-                {
-                    Debug.Log("[AudioBridge.Renderer] Audio thread exiting (Stop() was called)");
-                    break;  // Exit only if Stop() was called
-                }
-                
-                // If audio was disabled, log that we're waiting for re-enable
-                if (wasDisabled)
-                {
-                    Debug.Log("[AudioBridge.Renderer] Audio sharing was disabled, waiting for re-enable...");
-                    wasDisabled = false;
-                }
-                else
-                {
-                    Debug.Log("[AudioBridge.Renderer] Will retry connection in 2 seconds...");
-                }
-                Thread.Sleep(2000);
-            }
+            });
+
+            _messenger.ReceiveValueList<float>("floats", (list) => 
+            {
+                _audioSource?.SetStoredBuffer(list);
+
+            });
+        }
+        
+        private void AudioThreadMain()
+        {
+            
+
+            //// Check if we should exit or retry
+            //if (!_running)
+            //{
+            //	Debug.Log("[AudioBridge.Renderer] Audio thread exiting (Stop() was called)");
+            //	break;  // Exit only if Stop() was called
+            //}
+
+            //// If audio was disabled, log that we're waiting for re-enable
+            //if (wasDisabled)
+            //{
+            //	Debug.Log("[AudioBridge.Renderer] Audio sharing was disabled, waiting for re-enable...");
+            //	wasDisabled = false;
+            //}
+            //else
+            //{
+            //	Debug.Log("[AudioBridge.Renderer] Will retry connection in 2 seconds...");
+            //}
+            //Thread.Sleep(2000);
         }
         
         public void Stop()
         {
-            _running = false;
+            _stopped = true;
             _audioOut?.Stop();
             _audioOut?.Dispose();
-            _busReader?.Dispose();
-            _audioThread?.Join(1000);
+            _audioOut = null; // needed?
+            _messenger = null;
+            //_busReader?.Dispose();
+            //_audioThread?.Join(1000);
         }
         
         private void MuteCurrentProcessAudio(MMDevice device)
@@ -323,175 +299,148 @@ namespace AudioBridge.Renderer
             }
         }
     }
-    
-    public class ShadowBusReader : IDisposable
+
+    internal class ShadowBusData : IMemoryPackable
     {
-        private const string MMF_NAME = "AudioBridge_SharedMemory";
-        private const string MUTEX_NAME = "AudioBridge_SharedMemory_Mutex";
-        private const int HEADER_BYTES = 64;
-        private const int RING_BYTES = 2 * 1024 * 1024; // 2MB ring buffer for stable audio
-        
-        private MemoryMappedFile _mmf;
-        private MemoryMappedViewAccessor _view;
-        private Mutex _mutex;
-        private long _totalSamplesRead;
-        
-        public bool TryConnect()
+        public int sampleRate;
+        public int channels;
+        public int muteTarget;
+        public int enabled;
+        public string sessionId;
+        public void Pack(ref MemoryPacker packer)
         {
-            try
-            {
-                _mmf = MemoryMappedFile.OpenExisting(MMF_NAME, MemoryMappedFileRights.ReadWrite);
-                _mutex = Mutex.OpenExisting(MUTEX_NAME);
-                _view = _mmf.CreateViewAccessor(0, HEADER_BYTES + RING_BYTES, MemoryMappedFileAccess.ReadWrite);
-                return true;
-            }
-            catch
-            {
-                Dispose();
-                return false;
-            }
+            packer.Write(sampleRate);
+            packer.Write(channels);
+            packer.Write(muteTarget);
+            packer.Write(enabled);
+            packer.Write(sessionId);
         }
-        
-        public (int sampleRate, int channels) GetFormat()
+
+        public void Unpack(ref MemoryUnpacker unpacker)
         {
-            if (_mutex == null || _view == null) return (48000, 2);
-            
-            _mutex.WaitOne();
-            try
-            {
-                int sr = _view.ReadInt32(8);
-                int ch = _view.ReadInt32(12);
-                return (sr > 0 ? sr : 48000, ch > 0 ? ch : 2);
-            }
-            finally { _mutex.ReleaseMutex(); }
-        }
-        
-        public string GetSessionId()
-        {
-            if (_mutex == null || _view == null) return null;
-            
-            _mutex.WaitOne();
-            try
-            {
-                byte[] sessionBytes = new byte[36];
-                _view.ReadArray(24, sessionBytes, 0, 36);
-                
-                // Find null terminator
-                int length = Array.IndexOf(sessionBytes, (byte)0);
-                if (length == -1) length = 36;
-                if (length == 0) return null;
-                
-                return System.Text.Encoding.ASCII.GetString(sessionBytes, 0, length);
-            }
-            finally { _mutex.ReleaseMutex(); }
-        }
-        
-        public MuteTarget GetMuteTarget()
-        {
-            if (_mutex == null || _view == null) return MuteTarget.Renderer;
-            
-            _mutex.WaitOne();
-            try
-            {
-                int muteValue = _view.ReadInt32(16);
-                if (muteValue < 0 || muteValue > 2) return MuteTarget.Renderer;
-                return (MuteTarget)muteValue;
-            }
-            finally { _mutex.ReleaseMutex(); }
-        }
-        
-        public bool IsEnabled()
-        {
-            if (_mutex == null || _view == null) return false;
-            
-            _mutex.WaitOne();
-            try
-            {
-                return _view.ReadInt32(20) == 1;
-            }
-            finally { _mutex.ReleaseMutex(); }
-        }
-        
-        public void SyncWithWriter()
-        {
-            if (_mutex == null || _view == null) return;
-            
-            _mutex.WaitOne();
-            try
-            {
-                // Set read index to match write index (start reading from current position)
-                uint w = _view.ReadUInt32(0);
-                _view.Write(4, w);
-                Debug.Log($"[AudioBridge.Renderer] Synced read index to write index: {w}");
-            }
-            finally { _mutex.ReleaseMutex(); }
-        }
-        
-        public int ReadFloats(float[] buffer, int offset, int count)
-        {
-            if (_view == null) return 0;
-            
-            int bytesWanted = count * sizeof(float);
-            byte[] tempBuffer = new byte[bytesWanted];
-            int gotBytes = 0;
-            
-            _mutex.WaitOne();
-            try
-            {
-                uint w = _view.ReadUInt32(0);
-                uint r = _view.ReadUInt32(4);
-                
-                int avail = (int)((RING_BYTES + w - r) % RING_BYTES);
-                if (avail <= 0) return 0;
-                
-                int want = Math.Min(avail, bytesWanted);
-                int headOffset = HEADER_BYTES + (int)r;
-                int tail = Math.Min(want, RING_BYTES - (int)r);
-                
-                // Read first segment
-                _view.ReadArray(headOffset, tempBuffer, 0, tail);
-                
-                // Read wrapped segment if needed
-                if (want > tail)
-                {
-                    int rest = want - tail;
-                    _view.ReadArray(HEADER_BYTES, tempBuffer, tail, rest);
-                }
-                
-                // Update read index
-                r = (uint)((r + want) % RING_BYTES);
-                _view.Write(4, r);
-                gotBytes = want;
-            }
-            finally { _mutex.ReleaseMutex(); }
-            
-            // Convert bytes to floats
-            int floatsRead = gotBytes / sizeof(float);
-            Buffer.BlockCopy(tempBuffer, 0, buffer, offset, gotBytes);
-            
-            _totalSamplesRead += floatsRead;
-            return floatsRead;
-        }
-        
-        public void Dispose()
-        {
-            _view?.Dispose();
-            _mutex?.Dispose();
-            _mmf?.Dispose();
-            _view = null;
-            _mutex = null;
-            _mmf = null;
+            unpacker.Read(ref sampleRate);
+            unpacker.Read(ref channels);
+            unpacker.Read(ref muteTarget);
+            unpacker.Read(ref enabled);
+            unpacker.Read(ref sessionId);
         }
     }
+
+    //public class ShadowBusReader : IDisposable
+ //   {
+ //       private const string MMF_NAME = "AudioBridge_SharedMemory";
+ //       private const string MUTEX_NAME = "AudioBridge_SharedMemory_Mutex";
+ //       private const int HEADER_BYTES = 64;
+ //       private const int RING_BYTES = 2 * 1024 * 1024; // 2MB ring buffer for stable audio
+
+ //       //private MemoryMappedFile _mmf;
+ //       //private MemoryMappedViewAccessor _view;
+ //       //private Mutex _mutex;
+ //       //private MessageProcessingHandler
+ //       internal Messenger _messenger;
+ //       private long _totalSamplesRead;
+        
+ //       public bool TryConnect()
+ //       {
+ //           try
+ //           {
+ //               //_mmf = MemoryMappedFile.OpenExisting(MMF_NAME, MemoryMappedFileRights.ReadWrite);
+ //               //_mutex = Mutex.OpenExisting(MUTEX_NAME);
+ //               //_view = _mmf.CreateViewAccessor(0, HEADER_BYTES + RING_BYTES, MemoryMappedFileAccess.ReadWrite);
+ //               _messenger = new(MMF_NAME, new List<Type>() { typeof(ShadowBusData) });
+ //               return true;
+ //           }
+ //           catch
+ //           {
+ //               Dispose();
+ //               return false;
+ //           }
+ //       }
+        
+ //       //public MuteTarget GetMuteTarget()
+ //       //{
+ //       //    if (_mutex == null || _view == null) return MuteTarget.Renderer;
+            
+ //       //    _mutex.WaitOne();
+ //       //    try
+ //       //    {
+ //       //        int muteValue = _view.ReadInt32(16);
+ //       //        if (muteValue < 0 || muteValue > 2) return MuteTarget.Renderer;
+ //       //        return (MuteTarget)muteValue;
+ //       //    }
+ //       //    finally { _mutex.ReleaseMutex(); }
+ //       //}
+        
+ //       //public bool IsEnabled()
+ //       //{
+ //       //    if (_mutex == null || _view == null) return false;
+            
+ //       //    _mutex.WaitOne();
+ //       //    try
+ //       //    {
+ //       //        return _view.ReadInt32(20) == 1;
+ //       //    }
+ //       //    finally { _mutex.ReleaseMutex(); }
+ //       //}
+        
+ //       public int ReadFloats(float[] buffer, int offset, int count)
+ //       {
+ //           if (_view == null) return 0;
+            
+ //           int bytesWanted = count * sizeof(float);
+ //           byte[] tempBuffer = new byte[bytesWanted];
+ //           int gotBytes = 0;
+            
+ //           _mutex.WaitOne();
+ //           try
+ //           {
+ //               uint w = _view.ReadUInt32(0);
+ //               uint r = _view.ReadUInt32(4);
+                
+ //               int avail = (int)((RING_BYTES + w - r) % RING_BYTES);
+ //               if (avail <= 0) return 0;
+                
+ //               int want = Math.Min(avail, bytesWanted);
+ //               int headOffset = HEADER_BYTES + (int)r;
+ //               int tail = Math.Min(want, RING_BYTES - (int)r);
+                
+ //               // Read first segment
+ //               _view.ReadArray(headOffset, tempBuffer, 0, tail);
+                
+ //               // Read wrapped segment if needed
+ //               if (want > tail)
+ //               {
+ //                   int rest = want - tail;
+ //                   _view.ReadArray(HEADER_BYTES, tempBuffer, tail, rest);
+ //               }
+                
+ //               // Update read index
+ //               r = (uint)((r + want) % RING_BYTES);
+ //               _view.Write(4, r);
+ //               gotBytes = want;
+ //           }
+ //           finally { _mutex.ReleaseMutex(); }
+            
+ //           // Convert bytes to floats
+ //           int floatsRead = gotBytes / sizeof(float);
+ //           Buffer.BlockCopy(tempBuffer, 0, buffer, offset, gotBytes);
+            
+ //           _totalSamplesRead += floatsRead;
+ //           return floatsRead;
+ //       }
+        
+ //       public void Dispose()
+ //       {
+ //           _messenger = null;
+ //       }
+ //   }
     
     public class ShadowAudioSource : ISampleSource
     {
-        private readonly ShadowBusReader _reader;
         private readonly WaveFormat _format;
         
-        public ShadowAudioSource(ShadowBusReader reader, int sampleRate, int channels)
+        public ShadowAudioSource(int sampleRate, int channels)
         {
-            _reader = reader;
             _format = new WaveFormat(sampleRate, 32, channels, AudioEncoding.IeeeFloat);
         }
         
@@ -499,19 +448,44 @@ namespace AudioBridge.Renderer
         public bool CanSeek => false;
         public long Position { get => 0; set { } }
         public long Length => 0;
+
+        private float[] storedBuffer;
+        private object _lockObj = new();
+
+        public void SetStoredBuffer(List<float> newData)
+        {
+            lock (_lockObj)
+                storedBuffer = newData.ToArray();
+        }
         
         public int Read(float[] buffer, int offset, int count)
         {
             try
             {
-                int got = _reader.ReadFloats(buffer, offset, count);
-                
-                // Fill silence if needed
-                if (got < count)
+                while (storedBuffer is null)
                 {
-                    for (int i = offset + got; i < offset + count; i++)
+                    Thread.Sleep(1);
+                }
+                if (storedBuffer == null)
+                {
+                    Array.Clear(buffer, offset, count);
+                }
+                else
+                {
+                    lock (_lockObj)
                     {
-                        buffer[i] = 0f;
+                        Buffer.BlockCopy(storedBuffer, 0, buffer, offset, storedBuffer.Length);
+
+                        // Fill silence if needed
+                        if (storedBuffer.Length < count)
+                        {
+                            for (int i = offset + storedBuffer.Length; i < offset + count; i++)
+                            {
+                                buffer[i] = 0f;
+                            }
+                        }
+
+                        storedBuffer = null;
                     }
                 }
                 

@@ -1,14 +1,15 @@
-﻿using CSCore.CoreAudioAPI;
+﻿using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.NET.Common;
+using BepInExResoniteShim;
+using CSCore.CoreAudioAPI;
 using CSCore.SoundOut;
 using Elements.Core;
 using FrooxEngine;
 using HarmonyLib;
-using BepInEx;
-using BepInEx.Configuration;
-using BepInEx.NET.Common;
-using BepInExResoniteShim;
-using System.IO.MemoryMappedFiles;
-using System.Runtime.InteropServices;
+using InterprocessLib;
+using Renderite.Shared;
+using System.Threading.Channels;
 
 namespace AudioBridge;
 
@@ -185,11 +186,6 @@ public class AudioBridge : BasePlugin
                 if (ShadowBus.EnsureInit(writer: true))
                 {
                     UniLog.Log("[AudioBridge] Shared memory audio buffer initialized");
-                    // Reset buffer indices on initial start
-                    ShadowBus.ResetBufferIndices();
-                    // Explicitly publish that we're enabled
-                    ShadowBus.PublishEnabled(true);
-                    ShadowBus.PublishMuteTarget(_currentMuteTarget);
                     // Note: SessionID will be captured and written when the audio driver starts
                 }
                 else
@@ -230,11 +226,6 @@ public class AudioBridge : BasePlugin
                 {
                     UniLog.Log("[AudioBridge] Audio sharing enabled successfully");
                     
-                    // Reset buffer indices on re-enable for clean start
-                    ShadowBus.ResetBufferIndices();
-                    
-                    ShadowBus.PublishEnabled(true);
-                    
                     // Reset the writer state
                     ShadowWriterPatch.ResetState();
                     
@@ -271,9 +262,8 @@ public class AudioBridge : BasePlugin
             {
                 ShadowWriterPatch.ApplyMuteConfiguration(false);
             }
-            
-            // Publish disabled state before shutting down
-            ShadowBus.PublishEnabled(false);
+
+            ShadowBus._messenger.SendValue("enabled", false);
             
             // Wait a bit for renderer to see the change
             Task.Run(async () =>
@@ -295,8 +285,7 @@ public class AudioBridge : BasePlugin
         // Only process if enabled
         if (_isEnabled)
         {
-            // Publish the new mute target to shared memory
-            ShadowBus.PublishMuteTarget(_currentMuteTarget);
+            ShadowBus._messenger.SendValue("muteTarget", (int)_currentMuteTarget);
             
             // Update host muting based on the new target
             // Mute host if target is Host, unmute for Renderer or None
@@ -315,14 +304,55 @@ public class AudioBridge : BasePlugin
     internal static bool IsDebugLogging() => _debugLogging;
 }
 
+//internal struct ShadowBusBufferIndicies : IMemoryPackable
+//{
+//    public uint w;
+//    public uint r;
+//	public void Pack(ref MemoryPacker packer)
+//	{
+//		packer.Write(w);
+//        packer.Write(r);
+//	}
 
+//	public void Unpack(ref MemoryUnpacker unpacker)
+//	{
+//		unpacker.Read(ref w);
+//        unpacker.Read(ref r);
+//	}
+//}
+
+internal class ShadowBusData : IMemoryPackable
+{
+    public int sampleRate;
+    public int channels;
+    public int muteTarget;
+    public int enabled;
+    public string sessionId;
+    public void Pack(ref MemoryPacker packer)
+    {
+        packer.Write(sampleRate);
+        packer.Write(channels);
+        packer.Write(muteTarget);
+        packer.Write(enabled);
+        packer.Write(sessionId);
+    }
+
+    public void Unpack(ref MemoryUnpacker unpacker)
+    {
+        unpacker.Read(ref sampleRate);
+        unpacker.Read(ref channels);
+        unpacker.Read(ref muteTarget);
+        unpacker.Read(ref enabled);
+        unpacker.Read(ref sessionId);
+    }
+}
 
 // ===== Shared bus (host<->renderer) =====
 internal static class ShadowBus
 {
     // Use Local namespace (no prefix) to avoid permission issues
     private const string MMF_NAME = "AudioBridge_SharedMemory";
-    private const string MUTEX_NAME = "AudioBridge_SharedMemory_Mutex";
+    //private const string MUTEX_NAME = "AudioBridge_SharedMemory_Mutex";
 
     // Header layout (bytes)
     //  0..3  : uint writeIdx
@@ -335,19 +365,18 @@ internal static class ShadowBus
     // 60..63 : reserved
     private const int HEADER_BYTES = 64;
     private const int RING_BYTES = 2 * 1024 * 1024; // 2MB ring buffer for stable audio
-    private const int MMF_BYTES = HEADER_BYTES + RING_BYTES;
+    //private const int MMF_BYTES = HEADER_BYTES + RING_BYTES;
 
-    private static MemoryMappedFile _mmf;
-    private static MemoryMappedViewAccessor _view;
-    private static Mutex _mtx;
+    internal static Messenger _messenger;
 
-    private static volatile bool _inited;
+    //private static volatile bool _inited;
 
     public static bool EnsureInit(bool writer, int sampleRate = 48000, int channels = 2, string sessionId = null)
     {
-        if (_inited)
+        if (_messenger is not null)
         {
-            // Already initialized, return silently
+            // Already initialized
+            SendInitData(sampleRate, channels, sessionId);
             return true;
         }
         
@@ -356,101 +385,17 @@ internal static class ShadowBus
         
         try
         {
+            _messenger = new Messenger(MMF_NAME, [typeof(ShadowBusData)], []);
+
+            if (AudioBridge.IsDebugLogging())
+                UniLog.Log($"[AudioBridge] Messenger created: {MMF_NAME}");
+
             if (writer)
             {
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log($"[AudioBridge] Creating shared memory: {MMF_NAME}");
-                _mmf = MemoryMappedFile.CreateOrOpen(MMF_NAME, MMF_BYTES, MemoryMappedFileAccess.ReadWrite);
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log("[AudioBridge] Shared memory created");
-                
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log($"[AudioBridge] Creating synchronization mutex: {MUTEX_NAME}");
-                _mtx = new Mutex(false, MUTEX_NAME);
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log("[AudioBridge] Mutex created");
-                
-                _view = _mmf.CreateViewAccessor(0, MMF_BYTES, MemoryMappedFileAccess.ReadWrite);
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log("[AudioBridge] Memory accessor created");
-                
-                _mtx.WaitOne();
-                try
-                {
-                    // If first time, zero indices and write format
-                    uint w = _view.ReadUInt32(0);
-                    uint r = _view.ReadUInt32(4);
-                    if (AudioBridge.IsDebugLogging())
-                        UniLog.Log($"[AudioBridge] Buffer indices: write={w}, read={r}");
-                    
-                    if (w > RING_BYTES || r > RING_BYTES)
-                    {
-                        UniLog.Log("[AudioBridge] Resetting buffer indices");
-                        _view.Write(0, (uint)0);
-                        _view.Write(4, (uint)0);
-                    }
-                    
-                    _view.Write(8, sampleRate);
-                    _view.Write(12, channels);
-                    _view.Write(16, (int)AudioBridge.GetCurrentMuteTarget());
-                    _view.Write(20, AudioBridge.IsEnabled() ? 1 : 0);
-                    
-                    // Write SessionID if provided
-                    if (!string.IsNullOrEmpty(sessionId))
-                    {
-                        WriteSessionId(sessionId);
-                    }
-                    
-                    if (AudioBridge.IsDebugLogging())
-                        UniLog.Log($"[AudioBridge] Audio format: {sampleRate}Hz, {channels} channels, SessionID: {sessionId ?? "none"}");
-                }
-                finally { _mtx.ReleaseMutex(); }
-            }
-            else
-            {
-                UniLog.Log($"[AudioBridge] Opening shared memory: {MMF_NAME}");
-                
-                // For reader, try to wait for writer to create the MMF first
-                bool mmfExists = false;
-                Exception lastError = null;
-                
-                for (int attempt = 0; attempt < 10; attempt++)
-                {
-                    try
-                    {
-                        _mmf = MemoryMappedFile.OpenExisting(MMF_NAME, MemoryMappedFileRights.ReadWrite);
-                        mmfExists = true;
-                        UniLog.Log($"[AudioBridge] Shared memory opened on attempt {attempt + 1}");
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        lastError = ex;
-                        if (attempt < 9)
-                        {
-                            if (AudioBridge.IsDebugLogging())
-                            UniLog.Log($"[AudioBridge] Waiting for shared memory (attempt {attempt + 1}/10)");
-                            Thread.Sleep(500);
-                        }
-                    }
-                }
-                
-                if (!mmfExists)
-                {
-                    UniLog.Error($"[AudioBridge] Failed to open shared memory: {lastError?.Message}");
-                    throw new InvalidOperationException($"MMF {MMF_NAME} not found", lastError);
-                }
-                
-                UniLog.Log($"[AudioBridge] Opening synchronization mutex");
-                _mtx = Mutex.OpenExisting(MUTEX_NAME);
-                UniLog.Log("[AudioBridge] Mutex opened");
-                
-                _view = _mmf.CreateViewAccessor(0, MMF_BYTES, MemoryMappedFileAccess.ReadWrite);
-                UniLog.Log("[AudioBridge] Memory accessor created");
+                SendInitData(sampleRate, channels, sessionId);
             }
             
-            _inited = true;
-            UniLog.Log("[AudioBridge] Shared memory initialization complete");
+            UniLog.Log("[AudioBridge] Initialization complete");
             return true;
         }
         catch (Exception ex)
@@ -458,259 +403,114 @@ internal static class ShadowBus
             UniLog.Error($"[AudioBridge] Shared memory initialization failed: {ex.Message}");
             UniLog.Error($"[AudioBridge] Stack trace: {ex.StackTrace}");
             
-            // Clean up on failure
-            try { _view?.Dispose(); } catch { }
-            try { _mtx?.Dispose(); } catch { }
-            try { _mmf?.Dispose(); } catch { }
-            _view = null;
-            _mtx = null;
-            _mmf = null;
+            _messenger = null;
             
             return false;
         }
     }
 
-    public static void WriteSessionId(string sessionId)
+    private static void SendInitData(int sampleRate = 48000, int channels = 2, string sessionId = null)
     {
-        if (!_inited || string.IsNullOrEmpty(sessionId)) return;
-        
-        _mtx.WaitOne();
-        try
-        {
-            // Clear the SessionID area first
-            byte[] clearBytes = new byte[36];
-            _view.WriteArray(24, clearBytes, 0, 36);
-            
-            // Write the SessionID string (up to 36 chars)
-            byte[] sessionBytes = System.Text.Encoding.ASCII.GetBytes(sessionId);
-            int writeLength = Math.Min(sessionBytes.Length, 36);
-            _view.WriteArray(24, sessionBytes, 0, writeLength);
-            if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Written SessionID to shared memory: {sessionId}");
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static string ReadSessionId()
-    {
-        if (!_inited) return null;
-        
-        _mtx.WaitOne();
-        try
-        {
-            byte[] sessionBytes = new byte[36];
-            _view.ReadArray(24, sessionBytes, 0, 36);
-            
-            // Find null terminator
-            int length = Array.IndexOf(sessionBytes, (byte)0);
-            if (length == -1) length = 36;
-            if (length == 0) return null;
-            
-            return System.Text.Encoding.ASCII.GetString(sessionBytes, 0, length);
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static void PublishFormat(int sampleRate, int channels, string sessionId = null)
-    {
-        if (!_inited) return;
-        _mtx.WaitOne();
-        try
-        {
-            if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Publishing audio format: {sampleRate}Hz, {channels}ch, SessionID: {sessionId ?? "none"}");
-            _view.Write(8, sampleRate);
-            _view.Write(12, channels);
-            _view.Write(16, (int)AudioBridge.GetCurrentMuteTarget());
-            
-            if (!string.IsNullOrEmpty(sessionId))
-            {
-                WriteSessionId(sessionId);
-            }
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static void PublishMuteTarget(MuteTarget target)
-    {
-        if (!_inited) return;
-        _mtx.WaitOne();
-        try
-        {
-            _view.Write(16, (int)target);
-            if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Published mute target: {target}");
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
+        var muteTarget = AudioBridge.GetCurrentMuteTarget();
 
-    public static (int sampleRate, int channels) ReadFormat()
-    {
-        if (!_inited) return (48000, 2);
-        _mtx.WaitOne();
-        try
-        {
-            // Reading audio format
-            int sr = _view.ReadInt32(8);
-            int ch = _view.ReadInt32(12);
-            if (sr <= 0 || ch <= 0) return (48000, 2);
-            return (sr, ch);
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static MuteTarget ReadMuteTarget()
-    {
-        if (!_inited) return MuteTarget.Renderer;
-        _mtx.WaitOne();
-        try
-        {
-            int muteValue = _view.ReadInt32(16);
-            if (muteValue < 0 || muteValue > 2) return MuteTarget.Renderer;
-            return (MuteTarget)muteValue;
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static void PublishEnabled(bool enabled)
-    {
-        if (!_inited) return;
-        _mtx.WaitOne();
-        try
-        {
-            _view.Write(20, enabled ? 1 : 0);
-            
-            // Reset ring buffer indices when disabling to ensure clean restart
-            if (!enabled)
-            {
-                _view.Write(0, (uint)0);  // Reset write index
-                _view.Write(4, (uint)0);  // Reset read index
-                if (AudioBridge.IsDebugLogging())
-                    UniLog.Log("[AudioBridge] Reset buffer indices on disable");
-            }
-            
-            if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Published enabled state: {enabled}");
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static bool ReadEnabled()
-    {
-        if (!_inited) return false;
-        _mtx.WaitOne();
-        try
-        {
-            return _view.ReadInt32(20) == 1;
-        }
-        finally { _mtx.ReleaseMutex(); }
-    }
-    
-    public static void ResetBufferIndices()
-    {
-        if (!_inited) return;
-        _mtx.WaitOne();
-        try
-        {
-            _view.Write(0, (uint)0);  // Reset write index
-            _view.Write(4, (uint)0);  // Reset read index
-            if (AudioBridge.IsDebugLogging())
-                UniLog.Log("[AudioBridge] Buffer indices reset to 0");
-        }
-        finally { _mtx.ReleaseMutex(); }
+        var initData = new ShadowBusData();
+        initData.sampleRate = sampleRate;
+        initData.channels = channels;
+        initData.muteTarget = (int)muteTarget;
+        initData.enabled = AudioBridge.IsEnabled() ? 1 : 0;
+        initData.sessionId = sessionId;
+        _messenger.SendObject("initData", initData);
+
+        if (AudioBridge.IsDebugLogging())
+            UniLog.Log($"[AudioBridge] Audio format: {sampleRate}Hz, {channels} channels, muteTarget: {muteTarget}, enabled: {initData.enabled}, SessionID: {sessionId ?? "none"}");
     }
     
     public static void Shutdown()
     {
-        if (!_inited) return;
+        if (_messenger is null) return;
         
         UniLog.Log("[AudioBridge] Shutting down shared memory");
-        _inited = false;
         
-        try { _view?.Dispose(); } catch { }
-        try { _mtx?.Dispose(); } catch { }
-        try { _mmf?.Dispose(); } catch { }
-        
-        _view = null;
-        _mtx = null;
-        _mmf = null;
+        _messenger = null;
     }
 
     // Writer: float32 interleaved -> ring
     public static void WriteFloats(ReadOnlySpan<float> src)
     {
-        if (!_inited || src.IsEmpty) return;
+        if (src.IsEmpty) return;
 
-        var srcBytes = MemoryMarshal.AsBytes(src);
+        _messenger?.SendValueList("floats", src.ToArray().ToList()); // ToDo: optimize this
 
-        _mtx.WaitOne();
-        try
-        {
-            uint w = _view.ReadUInt32(0);
-            uint r = _view.ReadUInt32(4);
+        //var srcBytes = MemoryMarshal.AsBytes(src);
 
-            int free = (int)((RING_BYTES + r - w - 1) % RING_BYTES);
-            int want = Math.Min(free, srcBytes.Length);
-            if (want <= 0) return;
+        //_mtx.WaitOne();
+        //try
+        //{
+        //    //uint w = _view.ReadUInt32(0);
+        //    //uint r = _view.ReadUInt32(4);
 
-            int headOffset = HEADER_BYTES + (int)w;
-            int tail = Math.Min(want, RING_BYTES - (int)w);
+        //    int free = (int)((RING_BYTES + r - w - 1) % RING_BYTES);
+        //    int want = Math.Min(free, srcBytes.Length);
+        //    if (want <= 0) return;
 
-            _view.WriteArray(headOffset, srcBytes[..tail].ToArray(), 0, tail);
-            if (want > tail)
-            {
-                _view.WriteArray(HEADER_BYTES, srcBytes[tail..want].ToArray(), 0, want - tail);
-            }
+        //    int headOffset = HEADER_BYTES + (int)w;
+        //    int tail = Math.Min(want, RING_BYTES - (int)w);
 
-            w = (uint)((w + want) % RING_BYTES);
-            _view.Write(0, w);
-        }
-        finally { _mtx.ReleaseMutex(); }
+        //    _view.WriteArray(headOffset, srcBytes[..tail].ToArray(), 0, tail);
+        //    if (want > tail)
+        //    {
+        //        _view.WriteArray(HEADER_BYTES, srcBytes[tail..want].ToArray(), 0, want - tail);
+        //    }
+
+        //    w = (uint)((w + want) % RING_BYTES);
+        //    _view.Write(0, w);
+        //}
+        //finally { _mtx.ReleaseMutex(); }
     }
 
     // Reader: fill dst with float32 interleaved from ring; returns samples (floats) read
-    public static int ReadFloats(Span<float> dst)
-    {
-        if (!_inited || dst.IsEmpty) return 0;
+    //public static int ReadFloats(Span<float> dst)
+    //{
+    //    if (!_inited || dst.IsEmpty) return 0;
 
-        var dstBytes = MemoryMarshal.AsBytes(dst);
-        int gotBytes = 0;
+    //    var dstBytes = MemoryMarshal.AsBytes(dst);
+    //    int gotBytes = 0;
 
-        _mtx.WaitOne();
-        try
-        {
-            uint w = _view.ReadUInt32(0);
-            uint r = _view.ReadUInt32(4);
+    //    _mtx.WaitOne();
+    //    try
+    //    {
+    //        uint w = _view.ReadUInt32(0);
+    //        uint r = _view.ReadUInt32(4);
 
-            int avail = (int)((RING_BYTES + w - r) % RING_BYTES);
-            if (avail <= 0) return 0;
+    //        int avail = (int)((RING_BYTES + w - r) % RING_BYTES);
+    //        if (avail <= 0) return 0;
 
-            int want = Math.Min(avail, dstBytes.Length);
-            int headOffset = HEADER_BYTES + (int)r;
-            int tail = Math.Min(want, RING_BYTES - (int)r);
+    //        int want = Math.Min(avail, dstBytes.Length);
+    //        int headOffset = HEADER_BYTES + (int)r;
+    //        int tail = Math.Min(want, RING_BYTES - (int)r);
 
-            // First segment
-            var tmp = new byte[tail];
-            _view.ReadArray(headOffset, tmp, 0, tail);
-            tmp.CopyTo(dstBytes);
+    //        // First segment
+    //        var tmp = new byte[tail];
+    //        _view.ReadArray(headOffset, tmp, 0, tail);
+    //        tmp.CopyTo(dstBytes);
 
-            // Wrapped segment
-            if (want > tail)
-            {
-                int rest = want - tail;
-                var tmp2 = new byte[rest];
-                _view.ReadArray(HEADER_BYTES, tmp2, 0, rest);
-                tmp2.CopyTo(dstBytes[tail..]);
-            }
+    //        // Wrapped segment
+    //        if (want > tail)
+    //        {
+    //            int rest = want - tail;
+    //            var tmp2 = new byte[rest];
+    //            _view.ReadArray(HEADER_BYTES, tmp2, 0, rest);
+    //            tmp2.CopyTo(dstBytes[tail..]);
+    //        }
 
-            r = (uint)((r + want) % RING_BYTES);
-            _view.Write(4, r);
-            gotBytes = want;
-        }
-        finally { _mtx.ReleaseMutex(); }
+    //        r = (uint)((r + want) % RING_BYTES);
+    //        _view.Write(4, r);
+    //        gotBytes = want;
+    //    }
+    //    finally { _mtx.ReleaseMutex(); }
 
-        return gotBytes / sizeof(float); // floats read
-    }
+    //    return gotBytes / sizeof(float); // floats read
+    //}
 }
 
 // ===== Writer patch (Host process) =====
@@ -755,7 +555,7 @@ internal static class ShadowWriterPatch
             {
                 if (ShadowBus.EnsureInit(writer: true, sampleRate: fmt.SampleRate, channels: fmt.Channels, sessionId: _capturedSessionId))
                 {
-                    ShadowBus.PublishFormat(fmt.SampleRate, fmt.Channels, _capturedSessionId);
+                    //ShadowBus.PublishFormat(fmt.SampleRate, fmt.Channels, _capturedSessionId);
                     _busInitialized = true;
                     UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
                 }
@@ -817,7 +617,7 @@ internal static class ShadowWriterPatch
             {
                 if (ShadowBus.EnsureInit(writer: true, sampleRate: sampleRate, channels: channels, sessionId: _capturedSessionId))
                 {
-                    ShadowBus.PublishFormat(sampleRate, channels, _capturedSessionId);
+                    //ShadowBus.PublishFormat(sampleRate, channels, _capturedSessionId);
                     _busInitialized = true;
                     UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
                 }
@@ -980,11 +780,11 @@ internal static class ShadowWriterPatch
                                         _capturedSessionId = sessionId.ToString();
                                         if (AudioBridge.IsDebugLogging())
                                             UniLog.Log($"[AudioBridge] Captured Engine SessionID: {_capturedSessionId}");
-                                        
+
                                         // If bus is already initialized, update the SessionID
                                         if (_busInitialized && _capturedSessionId != null)
                                         {
-                                            ShadowBus.WriteSessionId(_capturedSessionId);
+                                            ShadowBus._messenger?.SendString("sessionId", _capturedSessionId);
                                         }
                                     }
                                 }
