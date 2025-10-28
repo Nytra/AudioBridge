@@ -43,7 +43,7 @@
       <Private>False</Private>
     </Reference>
     <Reference Include="InterprocessLib.Unity">
-        <HintPath>$(GamePath)Renderer\BepInEx\plugins\Nytra-InterprocessLib\plugins\InterprocessLib.BepInEx\InterprocessLib.Unity.dll</HintPath>
+        <HintPath>$(GamePath)Renderer\BepInEx\plugins\Nytra-InterprocessLib\InterprocessLib.BepInEx\InterprocessLib.Unity.dll</HintPath>
         <Private>False</Private>
     </Reference>
     <Reference Include="Renderite.Shared">

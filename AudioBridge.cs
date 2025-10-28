@@ -9,7 +9,6 @@ using FrooxEngine;
 using HarmonyLib;
 using InterprocessLib;
 using Renderite.Shared;
-using System.Threading.Channels;
 
 namespace AudioBridge;
 
@@ -263,7 +262,7 @@ public class AudioBridge : BasePlugin
                 ShadowWriterPatch.ApplyMuteConfiguration(false);
             }
 
-            ShadowBus._messenger.SendValue("enabled", false);
+            ShadowBus.Messenger!.SendValue("enabled", false);
             
             // Wait a bit for renderer to see the change
             Task.Run(async () =>
@@ -285,7 +284,7 @@ public class AudioBridge : BasePlugin
         // Only process if enabled
         if (_isEnabled)
         {
-            ShadowBus._messenger.SendValue("muteTarget", (int)_currentMuteTarget);
+            ShadowBus.Messenger!.SendValue("muteTarget", (int)_currentMuteTarget);
             
             // Update host muting based on the new target
             // Mute host if target is Host, unmute for Renderer or None
@@ -304,37 +303,47 @@ public class AudioBridge : BasePlugin
     internal static bool IsDebugLogging() => _debugLogging;
 }
 
-//internal struct ShadowBusBufferIndicies : IMemoryPackable
-//{
-//    public uint w;
-//    public uint r;
-//	public void Pack(ref MemoryPacker packer)
-//	{
-//		packer.Write(w);
-//        packer.Write(r);
-//	}
+internal class ShadowBusFloatsData : IMemoryPackable
+{
+    public float[]? data;
 
-//	public void Unpack(ref MemoryUnpacker unpacker)
-//	{
-//		unpacker.Read(ref w);
-//        unpacker.Read(ref r);
-//	}
-//}
+	public void Pack(ref MemoryPacker packer)
+	{
+        packer.Write(data!.Length);
+		foreach (var flt in data!)
+        {
+			packer.Write(flt);
+		}
+	}
 
-internal class ShadowBusData : IMemoryPackable
+	public void Unpack(ref MemoryUnpacker unpacker)
+	{
+		int len = 0;
+        unpacker.Read(ref len);
+        data = new float[len];
+        for (int i = 0; i < len; i++)
+        {
+            float flt = 0f;
+            unpacker.Read(ref flt);
+            data[i] = flt;
+        }
+	}
+}
+
+internal class ShadowBusInitData : IMemoryPackable
 {
     public int sampleRate;
     public int channels;
     public int muteTarget;
     public int enabled;
-    public string sessionId;
+    public string? sessionId;
     public void Pack(ref MemoryPacker packer)
     {
         packer.Write(sampleRate);
         packer.Write(channels);
         packer.Write(muteTarget);
         packer.Write(enabled);
-        packer.Write(sessionId);
+        packer.Write(sessionId!);
     }
 
     public void Unpack(ref MemoryUnpacker unpacker)
@@ -343,37 +352,20 @@ internal class ShadowBusData : IMemoryPackable
         unpacker.Read(ref channels);
         unpacker.Read(ref muteTarget);
         unpacker.Read(ref enabled);
-        unpacker.Read(ref sessionId);
+        unpacker.Read(ref sessionId!);
     }
 }
 
 // ===== Shared bus (host<->renderer) =====
 internal static class ShadowBus
 {
-    // Use Local namespace (no prefix) to avoid permission issues
-    private const string MMF_NAME = "AudioBridge_SharedMemory";
-    //private const string MUTEX_NAME = "AudioBridge_SharedMemory_Mutex";
+    private const string MESSENGER_NAME = "AudioBridge";
 
-    // Header layout (bytes)
-    //  0..3  : uint writeIdx
-    //  4..7  : uint readIdx
-    //  8..11 : int sampleRate
-    // 12..15 : int channels
-    // 16..19 : int muteTarget (0=None, 1=Host, 2=Renderer)
-    // 20..23 : int enabled (0=disabled, 1=enabled)
-    // 24..59 : string sessionId (36 bytes for GUID string)
-    // 60..63 : reserved
-    private const int HEADER_BYTES = 64;
-    private const int RING_BYTES = 2 * 1024 * 1024; // 2MB ring buffer for stable audio
-    //private const int MMF_BYTES = HEADER_BYTES + RING_BYTES;
+    internal static Messenger? Messenger;
 
-    internal static Messenger _messenger;
-
-    //private static volatile bool _inited;
-
-    public static bool EnsureInit(bool writer, int sampleRate = 48000, int channels = 2, string sessionId = null)
+    public static bool EnsureInit(bool writer, int sampleRate = 48000, int channels = 2, string? sessionId = null)
     {
-        if (_messenger is not null)
+        if (Messenger is not null)
         {
             // Already initialized
             SendInitData(sampleRate, channels, sessionId);
@@ -385,10 +377,10 @@ internal static class ShadowBus
         
         try
         {
-            _messenger = new Messenger(MMF_NAME, [typeof(ShadowBusData)], []);
+            Messenger = new Messenger(MESSENGER_NAME, [typeof(ShadowBusInitData), typeof(ShadowBusFloatsData)], []);
 
             if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Messenger created: {MMF_NAME}");
+                UniLog.Log($"[AudioBridge] Messenger created: {MESSENGER_NAME}");
 
             if (writer)
             {
@@ -403,23 +395,23 @@ internal static class ShadowBus
             UniLog.Error($"[AudioBridge] Shared memory initialization failed: {ex.Message}");
             UniLog.Error($"[AudioBridge] Stack trace: {ex.StackTrace}");
             
-            _messenger = null;
+            Messenger = null;
             
             return false;
         }
     }
 
-    private static void SendInitData(int sampleRate = 48000, int channels = 2, string sessionId = null)
+    private static void SendInitData(int sampleRate = 48000, int channels = 2, string? sessionId = null)
     {
         var muteTarget = AudioBridge.GetCurrentMuteTarget();
 
-        var initData = new ShadowBusData();
+        var initData = new ShadowBusInitData();
         initData.sampleRate = sampleRate;
         initData.channels = channels;
         initData.muteTarget = (int)muteTarget;
         initData.enabled = AudioBridge.IsEnabled() ? 1 : 0;
         initData.sessionId = sessionId;
-        _messenger.SendObject("initData", initData);
+        Messenger!.SendObject("initData", initData);
 
         if (AudioBridge.IsDebugLogging())
             UniLog.Log($"[AudioBridge] Audio format: {sampleRate}Hz, {channels} channels, muteTarget: {muteTarget}, enabled: {initData.enabled}, SessionID: {sessionId ?? "none"}");
@@ -427,11 +419,11 @@ internal static class ShadowBus
     
     public static void Shutdown()
     {
-        if (_messenger is null) return;
+        if (Messenger is null) return;
         
         UniLog.Log("[AudioBridge] Shutting down shared memory");
         
-        _messenger = null;
+        Messenger = null;
     }
 
     // Writer: float32 interleaved -> ring
@@ -439,78 +431,10 @@ internal static class ShadowBus
     {
         if (src.IsEmpty) return;
 
-        _messenger?.SendValueList("floats", src.ToArray().ToList()); // ToDo: optimize this
-
-        //var srcBytes = MemoryMarshal.AsBytes(src);
-
-        //_mtx.WaitOne();
-        //try
-        //{
-        //    //uint w = _view.ReadUInt32(0);
-        //    //uint r = _view.ReadUInt32(4);
-
-        //    int free = (int)((RING_BYTES + r - w - 1) % RING_BYTES);
-        //    int want = Math.Min(free, srcBytes.Length);
-        //    if (want <= 0) return;
-
-        //    int headOffset = HEADER_BYTES + (int)w;
-        //    int tail = Math.Min(want, RING_BYTES - (int)w);
-
-        //    _view.WriteArray(headOffset, srcBytes[..tail].ToArray(), 0, tail);
-        //    if (want > tail)
-        //    {
-        //        _view.WriteArray(HEADER_BYTES, srcBytes[tail..want].ToArray(), 0, want - tail);
-        //    }
-
-        //    w = (uint)((w + want) % RING_BYTES);
-        //    _view.Write(0, w);
-        //}
-        //finally { _mtx.ReleaseMutex(); }
+        var floatsData = new ShadowBusFloatsData();
+        floatsData.data = src.ToArray();
+		Messenger?.SendObject<ShadowBusFloatsData>("floats", floatsData); // ToDo: optimize this, allocating new arrays and lists constantly is bad
     }
-
-    // Reader: fill dst with float32 interleaved from ring; returns samples (floats) read
-    //public static int ReadFloats(Span<float> dst)
-    //{
-    //    if (!_inited || dst.IsEmpty) return 0;
-
-    //    var dstBytes = MemoryMarshal.AsBytes(dst);
-    //    int gotBytes = 0;
-
-    //    _mtx.WaitOne();
-    //    try
-    //    {
-    //        uint w = _view.ReadUInt32(0);
-    //        uint r = _view.ReadUInt32(4);
-
-    //        int avail = (int)((RING_BYTES + w - r) % RING_BYTES);
-    //        if (avail <= 0) return 0;
-
-    //        int want = Math.Min(avail, dstBytes.Length);
-    //        int headOffset = HEADER_BYTES + (int)r;
-    //        int tail = Math.Min(want, RING_BYTES - (int)r);
-
-    //        // First segment
-    //        var tmp = new byte[tail];
-    //        _view.ReadArray(headOffset, tmp, 0, tail);
-    //        tmp.CopyTo(dstBytes);
-
-    //        // Wrapped segment
-    //        if (want > tail)
-    //        {
-    //            int rest = want - tail;
-    //            var tmp2 = new byte[rest];
-    //            _view.ReadArray(HEADER_BYTES, tmp2, 0, rest);
-    //            tmp2.CopyTo(dstBytes[tail..]);
-    //        }
-
-    //        r = (uint)((r + want) % RING_BYTES);
-    //        _view.Write(4, r);
-    //        gotBytes = want;
-    //    }
-    //    finally { _mtx.ReleaseMutex(); }
-
-    //    return gotBytes / sizeof(float); // floats read
-    //}
 }
 
 // ===== Writer patch (Host process) =====
@@ -555,7 +479,6 @@ internal static class ShadowWriterPatch
             {
                 if (ShadowBus.EnsureInit(writer: true, sampleRate: fmt.SampleRate, channels: fmt.Channels, sessionId: _capturedSessionId))
                 {
-                    //ShadowBus.PublishFormat(fmt.SampleRate, fmt.Channels, _capturedSessionId);
                     _busInitialized = true;
                     UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
                 }
@@ -617,7 +540,6 @@ internal static class ShadowWriterPatch
             {
                 if (ShadowBus.EnsureInit(writer: true, sampleRate: sampleRate, channels: channels, sessionId: _capturedSessionId))
                 {
-                    //ShadowBus.PublishFormat(sampleRate, channels, _capturedSessionId);
                     _busInitialized = true;
                     UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
                 }
@@ -784,7 +706,7 @@ internal static class ShadowWriterPatch
                                         // If bus is already initialized, update the SessionID
                                         if (_busInitialized && _capturedSessionId != null)
                                         {
-                                            ShadowBus._messenger?.SendString("sessionId", _capturedSessionId);
+                                            ShadowBus.Messenger?.SendString("sessionId", _capturedSessionId);
                                         }
                                     }
                                 }
