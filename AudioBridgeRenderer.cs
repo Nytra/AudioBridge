@@ -1,6 +1,4 @@
 using System;
-using System.IO.MemoryMappedFiles;
-using System.Threading;
 using BepInEx;
 using UnityEngine;
 using CSCore;
