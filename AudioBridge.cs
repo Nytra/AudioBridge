@@ -307,18 +307,18 @@ internal class ShadowBusFloatsData : IMemoryPackable
 {
     public float[]? data;
 
-	public void Pack(ref MemoryPacker packer)
-	{
+    public void Pack(ref MemoryPacker packer)
+    {
         packer.Write(data!.Length);
-		foreach (var flt in data!)
+        foreach (var flt in data!)
         {
-			packer.Write(flt);
-		}
-	}
+            packer.Write(flt);
+        }
+    }
 
-	public void Unpack(ref MemoryUnpacker unpacker)
-	{
-		int len = 0;
+    public void Unpack(ref MemoryUnpacker unpacker)
+    {
+        int len = 0;
         unpacker.Read(ref len);
         data = new float[len];
         for (int i = 0; i < len; i++)
@@ -327,7 +327,7 @@ internal class ShadowBusFloatsData : IMemoryPackable
             unpacker.Read(ref flt);
             data[i] = flt;
         }
-	}
+    }
 }
 
 internal class ShadowBusInitData : IMemoryPackable
@@ -433,7 +433,7 @@ internal static class ShadowBus
 
         var floatsData = new ShadowBusFloatsData();
         floatsData.data = src.ToArray();
-		Messenger?.SendObject<ShadowBusFloatsData>("floats", floatsData); // ToDo: optimize this, allocating new arrays and lists constantly is bad
+        Messenger?.SendObject<ShadowBusFloatsData>("floats", floatsData); // ToDo: optimize this, allocating new arrays and lists constantly is bad
     }
 }
 

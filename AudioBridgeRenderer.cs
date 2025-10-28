@@ -23,7 +23,7 @@ namespace AudioBridge.Renderer
     }
     
     [BepInPlugin("com.knackrack615.AudioBridgeRenderer", "AudioBridge Renderer", "1.0.0")]
-	public class AudioBridgeRendererPlugin : BaseUnityPlugin
+    public class AudioBridgeRendererPlugin : BaseUnityPlugin
     {
         private ShadowAudioPlayer _audioPlayer;
         private bool _initialized = false;
@@ -265,34 +265,34 @@ namespace AudioBridge.Renderer
         }
     }
 
-	internal class ShadowBusFloatsData : IMemoryPackable
-	{
-		public float[] data;
+    internal class ShadowBusFloatsData : IMemoryPackable
+    {
+        public float[] data;
 
-		public void Pack(ref MemoryPacker packer)
-		{
-			packer.Write(data.Length);
-			foreach (var flt in data)
-			{
-				packer.Write(flt);
-			}
-		}
+        public void Pack(ref MemoryPacker packer)
+        {
+            packer.Write(data.Length);
+            foreach (var flt in data)
+            {
+                packer.Write(flt);
+            }
+        }
 
-		public void Unpack(ref MemoryUnpacker unpacker)
-		{
-			int len = 0;
-			unpacker.Read(ref len);
-			data = new float[len];
-			for (int i = 0; i < len; i++)
-			{
-				float flt = 0f;
-				unpacker.Read(ref flt);
-				data[i] = flt;
-			}
-		}
-	}
+        public void Unpack(ref MemoryUnpacker unpacker)
+        {
+            int len = 0;
+            unpacker.Read(ref len);
+            data = new float[len];
+            for (int i = 0; i < len; i++)
+            {
+                float flt = 0f;
+                unpacker.Read(ref flt);
+                data[i] = flt;
+            }
+        }
+    }
 
-	internal class ShadowBusInitData : IMemoryPackable
+    internal class ShadowBusInitData : IMemoryPackable
     {
         public int sampleRate;
         public int channels;
@@ -343,34 +343,34 @@ namespace AudioBridge.Renderer
                 {
                     audioQueue.Enqueue(flt);
                 }
-			}
+            }
 
-		}
+        }
         
         public int Read(float[] buffer, int offset, int count)
         {
             try
             {
-				lock (_lockObj)
-				{
+                lock (_lockObj)
+                {
                     int minSize = Math.Min(count, audioQueue.Count);
 
-					for (int i = offset; i < offset + minSize; i++)
+                    for (int i = offset; i < offset + minSize; i++)
                     {
                         buffer[i] = audioQueue.Dequeue();
                     }
 
-					// Fill silence if needed
-					if (minSize < count)
-					{
-						for (int i = offset + minSize; i < offset + count; i++)
-						{
-							buffer[i] = 0f;
-						}
-					}
-				}
+                    // Fill silence if needed
+                    if (minSize < count)
+                    {
+                        for (int i = offset + minSize; i < offset + count; i++)
+                        {
+                            buffer[i] = 0f;
+                        }
+                    }
+                }
 
-				return count;
+                return count;
             }
             catch
             {
