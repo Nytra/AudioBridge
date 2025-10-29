@@ -1,5 +1,6 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
+using BepInEx.Logging;
 using BepInEx.NET.Common;
 using BepInExResoniteShim;
 using CSCore.CoreAudioAPI;
@@ -29,6 +30,8 @@ public class AudioBridge : BasePlugin
     private static ConfigEntry<MuteTarget> MUTE_TARGET;
     private static ConfigEntry<bool> DEBUG_LOGGING;
 
+    private static new ManualLogSource? Log;
+
     private static MuteTarget _currentMuteTarget = MuteTarget.Host;
     private static bool _isEnabled = false;
     private static bool _debugLogging = false;
@@ -37,11 +40,13 @@ public class AudioBridge : BasePlugin
     {
         try
         {
+            Log = base.Log;
+
             ENABLED = Config.Bind("General", "Enabled", true, "Enable audio sharing to renderer process?");
             MUTE_TARGET = Config.Bind("General", "MuteTarget", MuteTarget.Host, "Which process to mute (prevents double audio)?");
             DEBUG_LOGGING = Config.Bind("General", "DebugLogging", false, "Enable debug/verbose logging?");
             
-            UniLog.Log("[AudioBridge] Initializing audio sharing module");
+            Log.LogInfo("[AudioBridge] Plugin loading!");
             
             _currentMuteTarget = MUTE_TARGET.Value;
             _isEnabled = ENABLED.Value;
@@ -51,10 +56,10 @@ public class AudioBridge : BasePlugin
             ENABLED.SettingChanged += (sender, args) => OnEnabledChanged();
             MUTE_TARGET.SettingChanged += (sender, args) => OnMuteTargetChanged();
             DEBUG_LOGGING.SettingChanged += (sender, args) => _debugLogging = DEBUG_LOGGING.Value;
-            UniLog.Log($"[AudioBridge] Mute target set to: {_currentMuteTarget}");
-            
+            Log.LogInfo($"[AudioBridge] Mute target set to: {_currentMuteTarget}");
+
             // Time to patch everything manually, yay!
-            UniLog.Log("[AudioBridge] Applying audio driver patches");
+            Log.LogInfo("[AudioBridge] Applying audio driver patches");
             var harmony = HarmonyInstance;
             
             try
@@ -68,7 +73,7 @@ public class AudioBridge : BasePlugin
                 int patchedCount = 0;
                 
                 if (_debugLogging)
-                    UniLog.Log($"[AudioBridge] Found {methods.Length} audio driver methods");
+                    Log.LogInfo($"[AudioBridge] Found {methods.Length} audio driver methods");
                 
                 foreach (var method in methods)
                 {
@@ -78,7 +83,7 @@ public class AudioBridge : BasePlugin
                         var parameters = method.GetParameters();
                         var paramInfo = string.Join(", ", parameters.Select(p => $"{p.ParameterType.Name} {p.Name}"));
                         if (_debugLogging)
-                            UniLog.Log($"[AudioBridge] Discovered audio method: {method.Name}({paramInfo})");
+                            Log.LogInfo($"[AudioBridge] Discovered audio method: {method.Name}({paramInfo})");
                         
                         // Try to patch each Read method with the appropriate postfix
                         if (method.DeclaringType == driverType)
@@ -112,20 +117,20 @@ public class AudioBridge : BasePlugin
                                     {
                                         harmony.Patch(method, postfix: new HarmonyMethod(postfix));
                                         if (_debugLogging)
-                                            UniLog.Log($"[AudioBridge] Successfully patched {method.Name}");
+                                            Log.LogInfo($"[AudioBridge] Successfully patched {method.Name}");
                                         patchedCount++;
                                     }
                                     else
                                     {
                                         if (_debugLogging)
-                                            UniLog.Log($"[AudioBridge] Patch method {postfixName} not found");
+                                            Log.LogInfo($"[AudioBridge] Patch method {postfixName} not found");
                                     }
                                 }
                             }
                             catch (Exception patchEx)
                             {
                                 if (_debugLogging)
-                                    UniLog.Log($"[AudioBridge] Failed to patch {method.Name}: {patchEx.Message}");
+                                    Log.LogError($"[AudioBridge] Failed to patch {method.Name}: {patchEx.Message}");
                             }
                         }
                     }
@@ -134,7 +139,7 @@ public class AudioBridge : BasePlugin
                 // Also check base class methods
                 var baseMethods = baseType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                 if (_debugLogging)
-                    UniLog.Log($"[AudioBridge] Base driver has {baseMethods.Length} methods");
+                    Log.LogInfo($"[AudioBridge] Base driver has {baseMethods.Length} methods");
                 
                 foreach (var method in baseMethods)
                 {
@@ -143,7 +148,7 @@ public class AudioBridge : BasePlugin
                         var parameters = method.GetParameters();
                         var paramInfo = string.Join(", ", parameters.Select(p => $"{p.ParameterType.Name} {p.Name}"));
                         if (_debugLogging)
-                            UniLog.Log($"[AudioBridge] Found base method: {method.Name}({paramInfo})");
+                            Log.LogInfo($"[AudioBridge] Found base method: {method.Name}({paramInfo})");
                         
                         // Patch Start method from base class
                         if (method.Name == "Start" && method.DeclaringType == baseType)
@@ -153,54 +158,35 @@ public class AudioBridge : BasePlugin
                                 var startPostfix = typeof(ShadowWriterPatch).GetMethod("Start_Base_Postfix",
                                     System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
                                 harmony.Patch(method, postfix: new HarmonyMethod(startPostfix));
-                                UniLog.Log("[AudioBridge] Patched base Start method");
+                                Log.LogInfo("[AudioBridge] Patched base Start method");
                             }
                             catch (Exception patchEx)
                             {
-                                UniLog.Log($"[AudioBridge] Failed to patch base Start: {patchEx.Message}");
+                                Log.LogError($"[AudioBridge] Failed to patch base Start: {patchEx.Message}");
                             }
                         }
                     }
                 }
                 
                 if (_debugLogging)
-                    UniLog.Log($"[AudioBridge] Successfully patched {patchedCount} audio methods");
+                    Log.LogInfo($"[AudioBridge] Successfully patched {patchedCount} audio methods");
             }
             catch (Exception ex)
             {
-                UniLog.Error($"[AudioBridge] Patching failed: {ex.Message}");
+                Log.LogError($"[AudioBridge] Patching failed: {ex.Message}");
             }
-            
-            UniLog.Log("[AudioBridge] Audio driver patching completed");
+
+            Log.LogInfo("[AudioBridge] Audio driver patching completed");
 
             // Check if enabled in config
-            UniLog.Log($"[AudioBridge] Audio sharing enabled: {_isEnabled}");
-            
-            if (_isEnabled)
-            {
-                UniLog.Log("[AudioBridge] Initializing audio writer for host process");
-                
-                // Initialize the bus as writer immediately
-                UniLog.Log("[AudioBridge] Initializing shared memory audio buffer");
-                if (ShadowBus.EnsureInit(writer: true))
-                {
-                    UniLog.Log("[AudioBridge] Shared memory audio buffer initialized");
-                    // Note: SessionID will be captured and written when the audio driver starts
-                }
-                else
-                {
-                    UniLog.Error("[AudioBridge] Failed to initialize shared memory buffer");
-                }
-            }
-            else
-            {
-                UniLog.Log("[AudioBridge] Audio sharing is disabled");
-            }
+            Log.LogInfo($"[AudioBridge] Audio sharing enabled: {_isEnabled}");
+
+            ShadowBus.CreateMessenger();
         }
         catch (Exception ex)
         {
-            UniLog.Error($"[AudioBridge] Initialization failed: {ex.Message}");
-            UniLog.Error($"[AudioBridge] Stack trace: {ex.StackTrace}");
+            Log.LogError($"[AudioBridge] Initialization failed: {ex.Message}");
+            Log.LogError($"[AudioBridge] Stack trace: {ex.StackTrace}");
         }
     }
 
@@ -212,7 +198,7 @@ public class AudioBridge : BasePlugin
     {
         var previousEnabled = _isEnabled;
         _isEnabled = ENABLED.Value;
-        UniLog.Log($"[AudioBridge] Audio sharing enabled changed from {previousEnabled} to {_isEnabled}");
+        UniLog.Log($"[AudioBridge] Enabled changed from {previousEnabled} to {_isEnabled}");
         
         if (_isEnabled && !previousEnabled)
         {
@@ -221,33 +207,33 @@ public class AudioBridge : BasePlugin
             Task.Run(async () =>
             {
                 await Task.Delay(100); // Small delay
-                if (ShadowBus.EnsureInit(writer: true))
+                if (true)//ShadowBus.InitAudio()) // ???
                 {
                     UniLog.Log("[AudioBridge] Audio sharing enabled successfully");
-                    
+
                     // Reset the writer state
-                    ShadowWriterPatch.ResetState();
-                    
+                    ShadowWriterPatch.ResetState(); // this will result in ShadowBus.Init being called
+
                     // Apply mute configuration if needed
-                    if (_currentMuteTarget == MuteTarget.Host)
-                    {
-                        // Try to apply mute configuration with a slight delay if audio device isn't ready
-                        Task.Run(async () =>
-                        {
-                            for (int i = 0; i < 10; i++)
-                            {
-                                if (ShadowWriterPatch.TryApplyMuteConfiguration(true))
-                                {
-                                    break;
-                                }
-                                await Task.Delay(500);
-                            }
-                        });
-                    }
+                    //if (_currentMuteTarget == MuteTarget.Host)
+                    //{
+                    //	// Try to apply mute configuration with a slight delay if audio device isn't ready
+                    //	Task.Run(async () =>
+                    //	{
+                    //		for (int i = 0; i < 10; i++)
+                    //		{
+                    //			if (ShadowWriterPatch.TryApplyMuteConfiguration(true))
+                    //			{
+                    //				break;
+                    //			}
+                    //			await Task.Delay(500);
+                    //		}
+                    //	});
+                    //}
                 }
                 else
                 {
-                    UniLog.Error("[AudioBridge] Failed to enable audio sharing");
+                    UniLog.Log("[AudioBridge] Failed to enable audio sharing");
                 }
             });
         }
@@ -255,23 +241,22 @@ public class AudioBridge : BasePlugin
         {
             // Disabling audio sharing
             UniLog.Log("[AudioBridge] Disabling audio sharing...");
-            
-            // Unmute host if it was muted
-            if (_currentMuteTarget == MuteTarget.Host)
-            {
-                ShadowWriterPatch.ApplyMuteConfiguration(false);
-            }
 
-            ShadowBus.Messenger!.SendValue("enabled", false);
-            
+            ShadowWriterPatch.TryApplySessionMuting(false);
+
+            ShadowBus.Messenger!.SendEmptyCommand("stop");
+
+            ShadowWriterPatch.ResetState();
+
+            UniLog.Log("[AudioBridge] Audio sharing disabled");
+
             // Wait a bit for renderer to see the change
-            Task.Run(async () =>
-            {
-                await Task.Delay(500);
-                ShadowBus.Shutdown();
-                ShadowWriterPatch.ResetState();
-                UniLog.Log("[AudioBridge] Audio sharing disabled");
-            });
+            //Task.Run(async () =>
+            //{
+            //    await Task.Delay(500); // needed?
+            //    ShadowWriterPatch.ResetState();
+            //    UniLog.Log("[AudioBridge] Audio sharing disabled");
+            //});
         }
     }
     
@@ -285,16 +270,8 @@ public class AudioBridge : BasePlugin
         if (_isEnabled)
         {
             ShadowBus.Messenger!.SendValue("muteTarget", (int)_currentMuteTarget);
-            
-            // Update host muting based on the new target
-            // Mute host if target is Host, unmute for Renderer or None
-            bool shouldMuteHost = (_currentMuteTarget == MuteTarget.Host);
-            
-            // Only apply if there's an actual change in host muting state
-            if (previousTarget == MuteTarget.Host || _currentMuteTarget == MuteTarget.Host)
-            {
-                ShadowWriterPatch.ApplyMuteConfiguration(shouldMuteHost);
-            }
+
+            ShadowWriterPatch.TryApplySessionMuting(_currentMuteTarget == MuteTarget.Host);
         }
     }
     
@@ -335,14 +312,12 @@ internal class ShadowBusInitData : IMemoryPackable
     public int sampleRate;
     public int channels;
     public int muteTarget;
-    public int enabled;
     public string? sessionId;
     public void Pack(ref MemoryPacker packer)
     {
         packer.Write(sampleRate);
         packer.Write(channels);
         packer.Write(muteTarget);
-        packer.Write(enabled);
         packer.Write(sessionId!);
     }
 
@@ -351,7 +326,6 @@ internal class ShadowBusInitData : IMemoryPackable
         unpacker.Read(ref sampleRate);
         unpacker.Read(ref channels);
         unpacker.Read(ref muteTarget);
-        unpacker.Read(ref enabled);
         unpacker.Read(ref sessionId!);
     }
 }
@@ -361,69 +335,39 @@ internal static class ShadowBus
 {
     private const string MESSENGER_NAME = "AudioBridge";
 
-    internal static Messenger? Messenger;
+    public static Messenger? Messenger;
 
-    public static bool EnsureInit(bool writer, int sampleRate = 48000, int channels = 2, string? sessionId = null)
+    public static void CreateMessenger()
     {
-        if (Messenger is not null)
-        {
-            // Already initialized
-            SendInitData(sampleRate, channels, sessionId);
-            return true;
-        }
-        
+        Messenger = new Messenger(MESSENGER_NAME, [typeof(ShadowBusInitData), typeof(ShadowBusFloatsData)], []);
+
         if (AudioBridge.IsDebugLogging())
-            UniLog.Log($"[AudioBridge] Initializing shared memory as {(writer ? "writer" : "reader")}");
-        
+            UniLog.Log($"[AudioBridge] Messenger created: {MESSENGER_NAME}");
+    }
+
+    public static bool InitAudio(int sampleRate = 48000, int channels = 2, string? sessionId = null)
+    {
         try
         {
-            Messenger = new Messenger(MESSENGER_NAME, [typeof(ShadowBusInitData), typeof(ShadowBusFloatsData)], []);
+            var initData = new ShadowBusInitData();
+            initData.sampleRate = sampleRate;
+            initData.channels = channels;
+            initData.muteTarget = (int)AudioBridge.GetCurrentMuteTarget();
+            initData.sessionId = sessionId;
+            Messenger!.SendObject("initData", initData);
 
             if (AudioBridge.IsDebugLogging())
-                UniLog.Log($"[AudioBridge] Messenger created: {MESSENGER_NAME}");
+                UniLog.Log($"[AudioBridge] Sent init data: {sampleRate}Hz, {channels} channels, muteTarget: {initData.muteTarget}, SessionID: {sessionId ?? "none"}");
 
-            if (writer)
-            {
-                SendInitData(sampleRate, channels, sessionId);
-            }
-            
-            UniLog.Log("[AudioBridge] Initialization complete");
+            ShadowWriterPatch.TryApplySessionMuting(initData.muteTarget == (int)MuteTarget.Host);
+
             return true;
         }
         catch (Exception ex)
         {
-            UniLog.Error($"[AudioBridge] Shared memory initialization failed: {ex.Message}");
-            UniLog.Error($"[AudioBridge] Stack trace: {ex.StackTrace}");
-            
-            Messenger = null;
-            
+            UniLog.Error($"[AudioBridge] Audio initialization failed: {ex.Message}");
             return false;
         }
-    }
-
-    private static void SendInitData(int sampleRate = 48000, int channels = 2, string? sessionId = null)
-    {
-        var muteTarget = AudioBridge.GetCurrentMuteTarget();
-
-        var initData = new ShadowBusInitData();
-        initData.sampleRate = sampleRate;
-        initData.channels = channels;
-        initData.muteTarget = (int)muteTarget;
-        initData.enabled = AudioBridge.IsEnabled() ? 1 : 0;
-        initData.sessionId = sessionId;
-        Messenger!.SendObject("initData", initData);
-
-        if (AudioBridge.IsDebugLogging())
-            UniLog.Log($"[AudioBridge] Audio format: {sampleRate}Hz, {channels} channels, muteTarget: {muteTarget}, enabled: {initData.enabled}, SessionID: {sessionId ?? "none"}");
-    }
-    
-    public static void Shutdown()
-    {
-        if (Messenger is null) return;
-        
-        UniLog.Log("[AudioBridge] Shutting down shared memory");
-        
-        Messenger = null;
     }
 
     // Writer: float32 interleaved -> ring
@@ -432,8 +376,8 @@ internal static class ShadowBus
         if (src.IsEmpty) return;
 
         var floatsData = new ShadowBusFloatsData();
-        floatsData.data = src.ToArray();
-        Messenger?.SendObject<ShadowBusFloatsData>("floats", floatsData); // ToDo: optimize this, allocating new arrays and lists constantly is bad
+        floatsData.data = src.ToArray(); // Is there a way to avoid allocating an array here?
+        Messenger?.SendObject("floats", floatsData);
     }
 }
 
@@ -444,10 +388,9 @@ internal static class ShadowWriterPatch
         _fOut = AccessTools.FieldRefAccess<CSCoreAudioOutputDriver, WasapiOut>("_out");
     
     private static bool _busInitialized = false;
-    private static WasapiOut _currentAudioOutput = null;
+    private static WasapiOut? _currentAudioOutput = null;
     private static bool _isMuted = false;
-    private static string _capturedSessionId = null;
-    private static bool _shouldMuteHostAudio = false;
+    private static string? _capturedSessionId = null;
     
     // Postfix for Read(float[], int, int)
     private static void Read_Float_Postfix(CSCoreAudioOutputDriver __instance, float[] buffer, int offset, int count, ref int __result)
@@ -477,10 +420,10 @@ internal static class ShadowWriterPatch
             // Initialize shared memory only once
             if (!_busInitialized)
             {
-                if (ShadowBus.EnsureInit(writer: true, sampleRate: fmt.SampleRate, channels: fmt.Channels, sessionId: _capturedSessionId))
+                if (ShadowBus.InitAudio(sampleRate: fmt.SampleRate, channels: fmt.Channels, sessionId: _capturedSessionId))
                 {
                     _busInitialized = true;
-                    UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
+                    UniLog.Log("[AudioBridge] Initialized audio");
                 }
                 else
                 {
@@ -492,7 +435,7 @@ internal static class ShadowWriterPatch
             ShadowBus.WriteFloats(buffer.AsSpan(offset, floatsRead));
             
             // If host should be muted, zero out the buffer AFTER sharing it
-            if (_shouldMuteHostAudio && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
+            if (AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
             {
                 Array.Clear(buffer, offset, floatsRead);
             }
@@ -538,10 +481,10 @@ internal static class ShadowWriterPatch
             // Initialize shared memory only once
             if (!_busInitialized)
             {
-                if (ShadowBus.EnsureInit(writer: true, sampleRate: sampleRate, channels: channels, sessionId: _capturedSessionId))
+                if (ShadowBus.InitAudio(sampleRate: sampleRate, channels: channels, sessionId: _capturedSessionId))
                 {
                     _busInitialized = true;
-                    UniLog.Log("[AudioBridge] Shared memory initialized for audio streaming");
+                    UniLog.Log("[AudioBridge] Initialized audio");
                 }
                 else
                 {
@@ -560,7 +503,7 @@ internal static class ShadowWriterPatch
                 ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
-                if (_shouldMuteHostAudio && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
+                if (AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
                 {
                     Array.Clear(buffer, offset, bytesRead);
                 }
@@ -587,7 +530,7 @@ internal static class ShadowWriterPatch
                 ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
-                if (_shouldMuteHostAudio && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
+                if (AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
                 {
                     Array.Clear(buffer, offset, bytesRead);
                 }
@@ -617,7 +560,7 @@ internal static class ShadowWriterPatch
                 ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
-                if (_shouldMuteHostAudio && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
+                if (AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
                 {
                     Array.Clear(buffer, offset, bytesRead);
                 }
@@ -648,7 +591,6 @@ internal static class ShadowWriterPatch
     {
         try
         {
-            
             // Log that ReadAuto was called
             if (!_loggedAuto && AudioBridge.IsDebugLogging())
             {
@@ -706,7 +648,7 @@ internal static class ShadowWriterPatch
                                         // If bus is already initialized, update the SessionID
                                         if (_busInitialized && _capturedSessionId != null)
                                         {
-                                            ShadowBus.Messenger?.SendString("sessionId", _capturedSessionId);
+                                            ShadowBus.Messenger?.SendString("sessionId", _capturedSessionId); // doesn't do anything
                                         }
                                     }
                                 }
@@ -742,11 +684,11 @@ internal static class ShadowWriterPatch
                         
                         // Store reference and apply muting if needed
                         _currentAudioOutput = outp;
-                        if (AudioBridge.IsEnabled() && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
-                        {
-                            UniLog.Log("[AudioBridge] Applying Host mute configuration on audio start");
-                            ApplyMuteConfiguration(true);
-                        }
+                        //if (AudioBridge.IsEnabled() && AudioBridge.GetCurrentMuteTarget() == MuteTarget.Host)
+                        //{
+                        //    UniLog.Log("[AudioBridge] Applying Host mute configuration on audio start");
+                        //    TryApplyMuteConfiguration(true);
+                        //}
                     }
                 }
             }
@@ -760,33 +702,28 @@ internal static class ShadowWriterPatch
     private static bool _loggedFormat = false;
     private static int _writeCounter = 0;
     
-    internal static bool TryApplyMuteConfiguration(bool shouldMute)
-    {
-        if (_currentAudioOutput == null || _currentAudioOutput.Device == null)
-        {
-            UniLog.Log("[AudioBridge] No audio device available to mute/unmute yet");
-            return false;
-        }
+    //internal static bool TryApplyMuteConfiguration(bool shouldMute)
+    //{
+    //    if (_currentAudioOutput == null || _currentAudioOutput.Device == null)
+    //    {
+    //        UniLog.Log("[AudioBridge] No audio device available to mute/unmute yet");
+    //        return false;
+    //    }
         
-        ApplyMuteConfiguration(shouldMute);
-        return true;
-    }
+    //    ApplyMuteConfiguration(shouldMute);
+    //    return true;
+    //}
     
-    internal static void ApplyMuteConfiguration(bool shouldMute)
+    internal static void TryApplySessionMuting(bool shouldMute)
     {
-        // Set the flag for buffer-level muting as primary approach
-        _shouldMuteHostAudio = shouldMute;
-        UniLog.Log($"[AudioBridge] Host audio buffer muting {(shouldMute ? "enabled" : "disabled")}");
-        
-        // Also try session-level muting as secondary approach
-        if (_currentAudioOutput == null || _currentAudioOutput.Device == null)
-        {
-            UniLog.Log("[AudioBridge] No audio device available for session muting (buffer muting will still work)");
-            return;
-        }
-        
         try
         {
+            if (_currentAudioOutput == null || _currentAudioOutput.Device == null)
+            {
+                UniLog.Log("[AudioBridge] No audio device available for session muting (buffer muting will still work)");
+                return;
+            }
+
             using var sessionManager = AudioSessionManager2.FromMMDevice(_currentAudioOutput.Device);
             using var sessionEnumerator = sessionManager.GetSessionEnumerator();
             var currentProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;

@@ -30,7 +30,7 @@
 	<ItemGroup>
 		<PackageReference Include="BepInEx.NET.CoreCLR" Version="6.0.0-be.*" IncludeAssets="compile" />
 		<PackageReference Include="BepInEx.ResonitePluginInfoProps" Version="3.*" />
-		<PackageReference Include="ResoniteModding.BepInExResoniteShim" Version="0.8.*" />
+		<PackageReference Include="ResoniteModding.BepInExResoniteShim" Version="0.9.*" />
 	</ItemGroup>
 	
 	<ItemGroup>
@@ -59,11 +59,11 @@
 			<Private>False</Private>
 		</Reference>
 		<Reference Include="System.Memory">
-			<HintPath>$(GamePath)\Renderer\Renderite.Renderer_Data\Managed\System.Memory.dll</HintPath>
+			<HintPath>$(GamePath)Renderer/Renderite.Renderer_Data/Managed/System.Memory.dll</HintPath>
 			<Private>False</Private>
 		</Reference>
 		<Reference Include="InterprocessLib.FrooxEngine">
-			<HintPath>$(GamePath)\BepInEx\plugins\Nytra-InterprocessLib\InterprocessLib.BepisLoader\InterprocessLib.FrooxEngine.dll</HintPath>
+			<HintPath>$(GamePath)BepInEx/plugins/Nytra-InterprocessLib/InterprocessLib.BepisLoader/InterprocessLib.FrooxEngine.dll</HintPath>
 			<Private>False</Private>
 		</Reference>
 	</ItemGroup>

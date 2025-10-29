@@ -9,6 +9,7 @@ using InterprocessLib;
 using Renderite.Shared;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace AudioBridge.Renderer
 {
@@ -70,11 +71,78 @@ namespace AudioBridge.Renderer
     {
         private WasapiOut _audioOut;
         private const string MESSENGER_NAME = "AudioBridge";
-        private bool _stopped;
         private Messenger _messenger;
         private MuteTarget _lastMuteTarget;
         private Task keepAlive;
         private ShadowAudioSource _audioSource;
+
+        private int _sampleRate;
+        private int _channels;
+        private MuteTarget _muteTarget;
+        private string _sessionId;
+
+        private void InitAudio()
+        {
+            if (_audioOut is not null) return;
+
+            Debug.Log($"[AudioBridge.Renderer] Audio format: {_sampleRate}Hz, {_channels} channels");
+            Debug.Log($"[AudioBridge.Renderer] Using SessionID: {_sessionId ?? "none"}");
+            Debug.Log($"[AudioBridge.Renderer] Mute target from host: {_muteTarget}");
+
+            // Create audio source
+            _audioSource = new ShadowAudioSource(_sampleRate, _channels);
+
+            // Initialize audio output with SessionID if available
+            if (!string.IsNullOrEmpty(_sessionId) && Guid.TryParse(_sessionId, out Guid sessionGuid))
+            {
+                // Use the same SessionID but with crossProcessSession: false to maintain separate control
+                // This groups them in Windows but keeps them as separate audio sessions for muting
+                _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20, sessionGuid, false);
+                Debug.Log($"[AudioBridge.Renderer] Created WasapiOut with SessionID: {sessionGuid} (crossProcess: false for independent muting)");
+            }
+            else
+            {
+                // Fallback to default if no SessionID
+                _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20);
+                Debug.Log("[AudioBridge.Renderer] Created WasapiOut without SessionID (legacy mode)");
+            }
+
+            _audioOut.Initialize(_audioSource.ToWaveSource());
+            _audioOut.Play();
+
+            Debug.Log("[AudioBridge.Renderer] Audio playback started");
+
+            if (_muteTarget == MuteTarget.Renderer)
+            {
+                // Mute this process's audio session so we don't hear it locally
+                // but it will still be available for recording/streaming
+                MuteCurrentProcessAudio(_audioOut.Device);
+            }
+
+            // Keep alive and monitor
+            keepAlive ??= Task.Run(async () =>
+            {
+                while (_audioOut is not null)
+                {
+                    await Task.Delay(5000);
+
+                    var playbackState = _audioOut?.PlaybackState ?? PlaybackState.Stopped;
+                    if (playbackState == PlaybackState.Stopped && _audioOut is not null)
+                    {
+                        Debug.LogWarning("[AudioBridge.Renderer] Audio playback stopped, attempting restart");
+                        try
+                        {
+                            _audioOut.Play();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError($"[AudioBridge.Renderer] Failed to restart playback: {ex.Message}");
+                        }
+                    }
+                }
+                keepAlive = null;
+            });
+        }
     
         public void Start()
         {
@@ -86,89 +154,29 @@ namespace AudioBridge.Renderer
 
             _messenger.ReceiveObject<ShadowBusInitData>("initData", (obj) =>
             {
-                if (_stopped) return;
+                _sampleRate = obj.sampleRate;
+                _channels = obj.channels;
+                _sessionId = obj.sessionId;
 
-                var sampleRate = obj.sampleRate;
-                var channels = obj.channels;
-                string sessionId = obj.sessionId;
-                Debug.Log($"[AudioBridge.Renderer] Audio format: {sampleRate}Hz, {channels} channels");
-                Debug.Log($"[AudioBridge.Renderer] Using SessionID: {sessionId ?? "none"}");
-
-                // Create audio source
-                _audioSource = new ShadowAudioSource(sampleRate, channels);
-
-                // Initialize audio output with SessionID if available
-                if (!string.IsNullOrEmpty(sessionId) && Guid.TryParse(sessionId, out Guid sessionGuid))
-                {
-                    // Use the same SessionID but with crossProcessSession: false to maintain separate control
-                    // This groups them in Windows but keeps them as separate audio sessions for muting
-                    _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20, sessionGuid, false);
-                    Debug.Log($"[AudioBridge.Renderer] Created WasapiOut with SessionID: {sessionGuid} (crossProcess: false for independent muting)");
-                }
+                if (obj.muteTarget < 0 || obj.muteTarget > 2)
+                    _muteTarget = MuteTarget.Renderer;
                 else
-                {
-                    // Fallback to default if no SessionID
-                    _audioOut = new WasapiOut(false, AudioClientShareMode.Shared, 20);
-                    Debug.Log("[AudioBridge.Renderer] Created WasapiOut without SessionID (legacy mode)");
-                }
+                    _muteTarget = (MuteTarget)obj.muteTarget;
 
-                _audioOut.Initialize(_audioSource.ToWaveSource());
-                _audioOut.Play();
-
-                Debug.Log("[AudioBridge.Renderer] Audio playback started");
-
-                MuteTarget muteTarget;
-                if (obj.muteTarget < 0 || obj.muteTarget > 2) muteTarget = MuteTarget.Renderer;
-                else
-                    muteTarget = (MuteTarget)obj.muteTarget;
-
-                Debug.Log($"[AudioBridge.Renderer] Mute target from host: {muteTarget}");
-
-                if (muteTarget == MuteTarget.Renderer)
-                {
-                    // Mute this process's audio session so we don't hear it locally
-                    // but it will still be available for recording/streaming
-                    MuteCurrentProcessAudio(_audioOut.Device);
-                }
-
-                // Keep alive and monitor
-                keepAlive ??= Task.Run(async () =>
-                {
-                    while (!_stopped)
-                    {
-                        await Task.Delay(5000);
-
-                        var playbackState = _audioOut?.PlaybackState ?? PlaybackState.Stopped;
-                        if (playbackState == PlaybackState.Stopped && !_stopped)
-                        {
-                            Debug.LogWarning("[AudioBridge.Renderer] Audio playback stopped, attempting restart");
-                            try
-                            {
-                                _audioOut?.Play();
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.LogError($"[AudioBridge.Renderer] Failed to restart playback: {ex.Message}");
-                            }
-                        }
-                    }
-                });
-                
+                InitAudio();
             });
 
-            _messenger.ReceiveValue<bool>("enabled", (val) =>
+            _messenger.ReceiveEmptyCommand("stop", () =>
             {
-                if (!val)
+                Debug.Log("[AudioBridge.Renderer] Audio sharing disabled by host, stopping playback");
+
+                // Clean up before potentially restarting
+                if (_audioOut != null)
                 {
-                    Debug.Log("[AudioBridge.Renderer] Audio sharing disabled by host, stopping playback");
-                    // Clean up before potentially restarting
-                    if (_audioOut != null)
-                    {
-                        Debug.Log("[AudioBridge.Renderer] Cleaning up audio output...");
-                        try { _audioOut.Stop(); } catch { }
-                        try { _audioOut.Dispose(); } catch { }
-                        _audioOut = null;
-                    }
+                    Debug.Log("[AudioBridge.Renderer] Cleaning up audio output...");
+                    try { _audioOut.Stop(); } catch { }
+                    try { _audioOut.Dispose(); } catch { }
+                    _audioOut = null;
                 }
             });
 
@@ -194,15 +202,18 @@ namespace AudioBridge.Renderer
             {
                 _audioSource?.EnqueueFloats(obj.data);
             });
+
+            _messenger.ReceiveString("sessionId", (str) => 
+            { 
+                Debug.Log($"Received sessionId: {str ?? "NULL"}");
+            });
         }
         
         public void Stop()
         {
-            _stopped = true;
             _audioOut?.Stop();
             _audioOut?.Dispose();
-            _audioOut = null; // needed?
-            _messenger = null;
+            _audioOut = null;
         }
         
         private void MuteCurrentProcessAudio(MMDevice device)
@@ -295,14 +306,12 @@ namespace AudioBridge.Renderer
         public int sampleRate;
         public int channels;
         public int muteTarget;
-        public int enabled;
         public string sessionId;
         public void Pack(ref MemoryPacker packer)
         {
             packer.Write(sampleRate);
             packer.Write(channels);
             packer.Write(muteTarget);
-            packer.Write(enabled);
             packer.Write(sessionId);
         }
 
@@ -311,7 +320,6 @@ namespace AudioBridge.Renderer
             unpacker.Read(ref sampleRate);
             unpacker.Read(ref channels);
             unpacker.Read(ref muteTarget);
-            unpacker.Read(ref enabled);
             unpacker.Read(ref sessionId);
         }
     }
