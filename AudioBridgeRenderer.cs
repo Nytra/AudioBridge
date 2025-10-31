@@ -1,15 +1,15 @@
-using System;
 using BepInEx;
-using UnityEngine;
 using CSCore;
 using CSCore.CoreAudioAPI;
 using CSCore.SoundOut;
-using Process = System.Diagnostics.Process;
 using InterprocessLib;
 using Renderite.Shared;
+using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using System.Threading;
+using System.Threading.Tasks;
+using UnityEngine;
+using Process = System.Diagnostics.Process;
 
 namespace AudioBridge.Renderer
 {
@@ -30,25 +30,7 @@ namespace AudioBridge.Renderer
         void Awake()
         {
             Logger.LogInfo("[AudioBridge.Renderer] Initializing audio renderer plugin");
-            
-            try
-            {
-                // Start immediately, no delay
-                InitializeAudio();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"Failed in Awake: {ex}");
-            }
-        }
-        
-        void InitializeAudio()
-        {
-            if (_initialized) return;
-            _initialized = true;
-            
-            Logger.LogInfo("[AudioBridge.Renderer] Starting shared memory audio reader");
-            
+
             try
             {
                 _audioPlayer = new ShadowAudioPlayer();
@@ -72,8 +54,6 @@ namespace AudioBridge.Renderer
         private WasapiOut _audioOut;
         private const string MESSENGER_NAME = "AudioBridge";
         private Messenger _messenger;
-        private MuteTarget _lastMuteTarget;
-        private Task keepAlive;
         private ShadowAudioSource _audioSource;
 
         private int _sampleRate;
@@ -81,13 +61,19 @@ namespace AudioBridge.Renderer
         private MuteTarget _muteTarget;
         private string _sessionId;
 
+        private CancellationTokenSource _cancellation;
+
         private void InitAudio()
         {
-            if (_audioOut is not null) return;
-
+            Debug.Log($"[AudioBridge.Renderer] AUDIO INIT");
             Debug.Log($"[AudioBridge.Renderer] Audio format: {_sampleRate}Hz, {_channels} channels");
             Debug.Log($"[AudioBridge.Renderer] Using SessionID: {_sessionId ?? "none"}");
             Debug.Log($"[AudioBridge.Renderer] Mute target from host: {_muteTarget}");
+
+            if (_audioOut is not null || _audioSource is not null)
+            {
+                throw new InvalidOperationException("Audio output exists!");
+            }
 
             // Create audio source
             _audioSource = new ShadowAudioSource(_sampleRate, _channels);
@@ -112,27 +98,27 @@ namespace AudioBridge.Renderer
 
             Debug.Log("[AudioBridge.Renderer] Audio playback started");
 
-            if (_muteTarget == MuteTarget.Renderer)
-            {
-                // Mute this process's audio session so we don't hear it locally
-                // but it will still be available for recording/streaming
-                MuteCurrentProcessAudio(_audioOut.Device);
-            }
+            UpdateSessionMuting();
 
-            // Keep alive and monitor
-            keepAlive ??= Task.Run(async () =>
+            _cancellation = new();
+
+            //Keep alive and monitor
+            Task.Run(async () =>
             {
                 while (_audioOut is not null)
                 {
                     await Task.Delay(5000);
 
-                    var playbackState = _audioOut?.PlaybackState ?? PlaybackState.Stopped;
-                    if (playbackState == PlaybackState.Stopped && _audioOut is not null)
+                    if (_audioOut is null) break;
+
+                    var playbackState = _audioOut.PlaybackState;
+                    if (playbackState == PlaybackState.Stopped)
                     {
                         Debug.LogWarning("[AudioBridge.Renderer] Audio playback stopped, attempting restart");
                         try
                         {
                             _audioOut.Play();
+                            Debug.Log("[AudioBridge.Renderer] Audio playback restarted");
                         }
                         catch (Exception ex)
                         {
@@ -140,8 +126,7 @@ namespace AudioBridge.Renderer
                         }
                     }
                 }
-                keepAlive = null;
-            });
+            }, _cancellation.Token);
         }
     
         public void Start()
@@ -157,11 +142,7 @@ namespace AudioBridge.Renderer
                 _sampleRate = obj.sampleRate;
                 _channels = obj.channels;
                 _sessionId = obj.sessionId;
-
-                if (obj.muteTarget < 0 || obj.muteTarget > 2)
-                    _muteTarget = MuteTarget.Renderer;
-                else
-                    _muteTarget = (MuteTarget)obj.muteTarget;
+                _muteTarget = (MuteTarget)obj.muteTarget;
 
                 InitAudio();
             });
@@ -169,32 +150,17 @@ namespace AudioBridge.Renderer
             _messenger.ReceiveEmptyCommand("stop", () =>
             {
                 Debug.Log("[AudioBridge.Renderer] Audio sharing disabled by host, stopping playback");
-
-                // Clean up before potentially restarting
-                if (_audioOut != null)
-                {
-                    Debug.Log("[AudioBridge.Renderer] Cleaning up audio output...");
-                    try { _audioOut.Stop(); } catch { }
-                    try { _audioOut.Dispose(); } catch { }
-                    _audioOut = null;
-                }
+                Stop();
             });
 
             _messenger.ReceiveValue<int>("muteTarget", (val) =>
             {
                 var muteTarget = (MuteTarget)val;
-                if (muteTarget != _lastMuteTarget)
+                if (muteTarget != _muteTarget)
                 {
                     Debug.Log($"[AudioBridge.Renderer] Mute target changed to: {muteTarget}");
-                    if (muteTarget == MuteTarget.Renderer)
-                    {
-                        MuteCurrentProcessAudio(_audioOut.Device);
-                    }
-                    else if (_lastMuteTarget == MuteTarget.Renderer)
-                    {
-                        UnmuteCurrentProcessAudio(_audioOut.Device);
-                    }
-                    _lastMuteTarget = muteTarget;
+                    _muteTarget = muteTarget;
+                    UpdateSessionMuting();
                 }
             });
 
@@ -202,18 +168,34 @@ namespace AudioBridge.Renderer
             {
                 _audioSource?.EnqueueFloats(obj.data);
             });
-
-            _messenger.ReceiveString("sessionId", (str) => 
-            { 
-                Debug.Log($"Received sessionId: {str ?? "NULL"}");
-            });
         }
         
         public void Stop()
         {
-            _audioOut?.Stop();
-            _audioOut?.Dispose();
+            _cancellation.Cancel();
+            _cancellation = null;
+            var audioOut = _audioOut;
+            audioOut?.Stop();
+            audioOut?.Dispose();
             _audioOut = null;
+            var audioSource = _audioSource;
+            audioSource?.Dispose();
+            _audioSource = null;
+        }
+
+        private void UpdateSessionMuting()
+        {
+            if (_audioOut?.Device is not null)
+            {
+                if (_muteTarget == MuteTarget.Renderer)
+                {
+                    MuteCurrentProcessAudio(_audioOut.Device);
+                }
+                else
+                {
+                    UnmuteCurrentProcessAudio(_audioOut.Device);
+                }
+            }
         }
         
         private void MuteCurrentProcessAudio(MMDevice device)
@@ -326,7 +308,7 @@ namespace AudioBridge.Renderer
     
     public class ShadowAudioSource : ISampleSource
     {
-        private readonly WaveFormat _format;
+        private WaveFormat _format;
         
         public ShadowAudioSource(int sampleRate, int channels)
         {
@@ -340,17 +322,18 @@ namespace AudioBridge.Renderer
 
         private Queue<float> audioQueue = new();
         private object _lockObj = new();
+        private bool _disposed = false;
 
         public void EnqueueFloats(float[] newData)
         {
             lock (_lockObj)
             {
+                if (_disposed) return;
                 foreach (var flt in newData)
                 {
                     audioQueue.Enqueue(flt);
                 }
             }
-
         }
         
         public int Read(float[] buffer, int offset, int count)
@@ -359,6 +342,12 @@ namespace AudioBridge.Renderer
             {
                 lock (_lockObj)
                 {
+                    if (_disposed)
+                    {
+                        Array.Clear(buffer, offset, count);
+                        return count;
+                    }
+
                     int minSize = Math.Min(count, audioQueue.Count);
 
                     for (int i = offset; i < offset + minSize; i++)
@@ -369,22 +358,32 @@ namespace AudioBridge.Renderer
                     // Fill silence if needed
                     if (minSize < count)
                     {
-                        for (int i = offset + minSize; i < offset + count; i++)
-                        {
-                            buffer[i] = 0f;
-                        }
+                        Array.Clear(buffer, offset + minSize, count - minSize);
+                        //for (int i = offset + minSize; i < offset + count; i++)
+                        //{
+                        //    buffer[i] = 0f;
+                        //}
                     }
                 }
 
                 return count;
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.LogError($"Exception in ShadowAudioSource Read\n{ex}");
                 Array.Clear(buffer, offset, count);
                 return count;
             }
         }
         
-        public void Dispose() { }
+        public void Dispose()
+        {
+            lock (_lockObj)
+            {
+                audioQueue.Clear();
+                audioQueue = null;
+                _disposed = true;
+            }
+        }
     }
 }
