@@ -6,8 +6,6 @@ using InterprocessLib;
 using Renderite.Shared;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 using Process = System.Diagnostics.Process;
@@ -22,7 +20,7 @@ namespace AudioBridge.Renderer
         Renderer = 2
     }
     
-    [BepInPlugin("com.knackrack615.AudioBridgeRenderer", "AudioBridge Renderer", "1.0.0")]
+    [BepInPlugin("com.knackrack615.AudioBridgeRenderer", "AudioBridge Renderer", "3.0.0")]
     public class AudioBridgeRendererPlugin : BaseUnityPlugin
     {
         private ShadowAudioPlayer _audioPlayer;

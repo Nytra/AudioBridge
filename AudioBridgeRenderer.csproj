@@ -17,7 +17,7 @@
   <PropertyGroup>
     <GamePath Condition="Exists('/mnt/c/Program Files (x86)/Steam/steamapps/common/Resonite/')">/mnt/c/Program Files (x86)/Steam/steamapps/common/Resonite/</GamePath>
     <GamePath Condition="Exists('G:\SteamLibrary\steamapps\common\Resonite\')">G:\SteamLibrary\steamapps\common\Resonite\</GamePath>
-    <PluginTargetDir>$(GamePath)Renderer\BepInEx\plugins\$(AssemblyName)</PluginTargetDir>
+    <PluginTargetDir>$(GamePath)Renderer/BepInEx/plugins/$(AssemblyName)</PluginTargetDir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -43,7 +43,7 @@
       <Private>False</Private>
     </Reference>
     <Reference Include="InterprocessLib.Unity">
-        <HintPath>$(GamePath)Renderer\BepInEx\plugins\Nytra-InterprocessLib\InterprocessLib.BepInEx\InterprocessLib.Unity.dll</HintPath>
+        <HintPath>$(GamePath)Renderer/BepInEx/plugins/Nytra-InterprocessLib/InterprocessLib.BepInEx/InterprocessLib.Unity.dll</HintPath>
         <Private>False</Private>
     </Reference>
     <Reference Include="Renderite.Shared">

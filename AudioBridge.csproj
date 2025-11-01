@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<Version>2.0.0</Version>
-		<Authors>Knackrack615</Authors>
+		<Version>3.0.0</Version>
+		<Authors>Knackrack615, Nytra</Authors>
 		<TargetFramework>net9.0</TargetFramework>
 		<RepositoryUrl>https://github.com/knackrack615/AudioBridge</RepositoryUrl>
 		<PackageId>knackrack615.audiobridge</PackageId>
@@ -24,7 +24,7 @@
 		<GamePath Condition="Exists('$(HOME)/.steam/steam/steamapps/common/Resonite/')">$(HOME)/.steam/steam/steamapps/common/Resonite/</GamePath>
 		<GamePath Condition="Exists('/mnt/c/Program Files (x86)/Steam/steamapps/common/Resonite/')">/mnt/c/Program Files (x86)/Steam/steamapps/common/Resonite/</GamePath>
 		<GamePath Condition="Exists('G:\SteamLibrary\steamapps\common\Resonite\')">G:\SteamLibrary\steamapps\common\Resonite\</GamePath>
-		<PluginTargetDir>$(GamePath)BepInEx\plugins\$(AssemblyName)</PluginTargetDir>
+		<PluginTargetDir>$(GamePath)BepInEx/plugins/$(AssemblyName)</PluginTargetDir>
 	</PropertyGroup>
 
 	<ItemGroup>
