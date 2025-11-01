@@ -6,6 +6,7 @@ using InterprocessLib;
 using Renderite.Shared;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -25,7 +26,6 @@ namespace AudioBridge.Renderer
     public class AudioBridgeRendererPlugin : BaseUnityPlugin
     {
         private ShadowAudioPlayer _audioPlayer;
-        private bool _initialized = false;
         
         void Awake()
         {
@@ -61,7 +61,10 @@ namespace AudioBridge.Renderer
         private MuteTarget _muteTarget;
         private string _sessionId;
 
-        private CancellationTokenSource _cancellation;
+        private bool _startedInitTask;
+        private bool _stopped = true;
+
+        private Task _keepAlive;
 
         private void InitAudio()
         {
@@ -96,14 +99,14 @@ namespace AudioBridge.Renderer
             _audioOut.Initialize(_audioSource.ToWaveSource());
             _audioOut.Play();
 
+            _stopped = false;
+
             Debug.Log("[AudioBridge.Renderer] Audio playback started");
 
             UpdateSessionMuting();
 
-            _cancellation = new();
-
             //Keep alive and monitor
-            Task.Run(async () =>
+            _keepAlive ??= Task.Run(async () =>
             {
                 while (_audioOut is not null)
                 {
@@ -126,7 +129,8 @@ namespace AudioBridge.Renderer
                         }
                     }
                 }
-            }, _cancellation.Token);
+                _keepAlive = null;
+            });
         }
     
         public void Start()
@@ -144,7 +148,26 @@ namespace AudioBridge.Renderer
                 _sessionId = obj.sessionId;
                 _muteTarget = (MuteTarget)obj.muteTarget;
 
-                InitAudio();
+                if (!_stopped)
+                {
+                    if (!_startedInitTask)
+                    {
+                        Task.Run(async () =>
+                        {
+                            while (!_stopped)
+                            {
+                                await Task.Delay(1);
+                            }
+                            InitAudio();
+                            _startedInitTask = false;
+                        });
+                        _startedInitTask = true;
+                    }
+                }
+                else
+                {
+                    InitAudio();
+                }
             });
 
             _messenger.ReceiveEmptyCommand("stop", () =>
@@ -156,31 +179,25 @@ namespace AudioBridge.Renderer
             _messenger.ReceiveValue<int>("muteTarget", (val) =>
             {
                 var muteTarget = (MuteTarget)val;
-                if (muteTarget != _muteTarget)
-                {
-                    Debug.Log($"[AudioBridge.Renderer] Mute target changed to: {muteTarget}");
-                    _muteTarget = muteTarget;
-                    UpdateSessionMuting();
-                }
+                Debug.Log($"[AudioBridge.Renderer] Mute target changed to: {muteTarget}");
+                _muteTarget = muteTarget;
+                UpdateSessionMuting();
             });
 
             _messenger.ReceiveObject<ShadowBusFloatsData>("floats", (obj) => 
             {
-                _audioSource?.EnqueueFloats(obj.data);
+                _audioSource.EnqueueFloats(obj.data);
             });
         }
         
         public void Stop()
         {
-            _cancellation.Cancel();
-            _cancellation = null;
-            var audioOut = _audioOut;
-            audioOut?.Stop();
-            audioOut?.Dispose();
+            _audioOut?.Stop();
+            _audioOut?.Dispose();
             _audioOut = null;
-            var audioSource = _audioSource;
-            audioSource?.Dispose();
+            _audioSource?.Dispose();
             _audioSource = null;
+            _stopped = true;
         }
 
         private void UpdateSessionMuting()
@@ -308,7 +325,7 @@ namespace AudioBridge.Renderer
     
     public class ShadowAudioSource : ISampleSource
     {
-        private WaveFormat _format;
+        private readonly WaveFormat _format;
         
         public ShadowAudioSource(int sampleRate, int channels)
         {
@@ -359,14 +376,10 @@ namespace AudioBridge.Renderer
                     if (minSize < count)
                     {
                         Array.Clear(buffer, offset + minSize, count - minSize);
-                        //for (int i = offset + minSize; i < offset + count; i++)
-                        //{
-                        //    buffer[i] = 0f;
-                        //}
                     }
-                }
 
-                return count;
+                    return count;
+                }
             }
             catch (Exception ex)
             {
@@ -378,6 +391,7 @@ namespace AudioBridge.Renderer
         
         public void Dispose()
         {
+            Debug.Log("[AudioBridge.Renderer] Disposing ShadowAudioSource...");
             lock (_lockObj)
             {
                 audioQueue.Clear();
