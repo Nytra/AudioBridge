@@ -30,14 +30,14 @@ public class AudioBridge : BasePlugin
     private static ConfigEntry<MuteTarget>? _muteTarget;
     private static ConfigEntry<bool>? _debugLogging;
 
-    private static bool _actualEnabled;
-
     internal static new ManualLogSource? Log;
 
     internal static bool ShouldMute => Enabled && MuteTarget == MuteTarget.Host;
+
     internal static MuteTarget MuteTarget => _muteTarget!.Value;
-    internal static bool Enabled => _actualEnabled;
+    internal static bool Enabled => _enabled!.Value;
     internal static bool DebugLogging => _debugLogging!.Value;
+
     internal static bool Ready
     {
         get
@@ -67,9 +67,9 @@ public class AudioBridge : BasePlugin
             _enabled.SettingChanged += (sender, args) => OnEnabledChanged();
             _muteTarget.SettingChanged += (sender, args) => OnMuteTargetChanged();
 
-            Log.LogInfo($"[AudioBridge] On load mute target: {MuteTarget}");
-            Log.LogInfo($"[AudioBridge] On load enabled: {Enabled}");
-            Log.LogInfo($"[AudioBridge] On load debug logging: {DebugLogging}");
+            Log.LogInfo($"[AudioBridge] On load mute target: {_muteTarget.Value}");
+            Log.LogInfo($"[AudioBridge] On load enabled: {_enabled.Value}");
+            Log.LogInfo($"[AudioBridge] On load debug logging: {_debugLogging.Value}");
 
             // Time to patch everything manually, yay!
             Log.LogInfo("[AudioBridge] Applying audio driver patches");
@@ -209,14 +209,11 @@ public class AudioBridge : BasePlugin
 
         if (!Ready)
         {
-            _actualEnabled = _enabled.Value;
             return;
         }
 
         if (_enabled.Value)
         {
-            _actualEnabled = true;
-
             UniLog.Log("[AudioBridge] Enabling audio sharing");
             ShadowWriterPatch.ResetState();
         }
@@ -226,13 +223,6 @@ public class AudioBridge : BasePlugin
 
             if (ShadowBus.Initialized)
                 ShadowBus.Shutdown();
-
-            Task.Run(async () => 
-            { 
-                await Task.Delay(100);
-                _actualEnabled = false;
-                ShadowWriterPatch.UpdateSessionMuting();
-            });
         }
     }
     
@@ -417,13 +407,18 @@ internal static class ShadowWriterPatch
     private static bool _loggedFormat = false;
     private static int _writeCounter = 0;
 
+    private static bool _patchesEnabled = true;
+    private static DateTime? _shadowBusDisabledTime = null;
+
+    private const float DEACTIVATE_TIME_SECONDS = 0.5f;
+
     // Postfix for Read(float[], int, int)
     private static void Read_Float_Postfix(CSCoreAudioOutputDriver __instance, float[] buffer, int offset, int count, ref int __result)
     {
         try
         {
             // Check if audio sharing is enabled
-            if (!AudioBridge.Enabled) return;
+            if (!_patchesEnabled) return;
             if (_initFailed) return;
             if (!AudioBridge.Ready) return;
             
@@ -476,6 +471,17 @@ internal static class ShadowWriterPatch
             {
                 UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks");
             }
+
+            if (!ShadowBus.Initialized)
+            {
+                if (_shadowBusDisabledTime is null)
+                    _shadowBusDisabledTime = DateTime.Now;
+                else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
+                {
+                    _patchesEnabled = false;
+                    ShadowWriterPatch.UpdateSessionMuting();
+                }
+            }
         }
         catch (Exception ex) { UniLog.Error($"Audio float processing error: {ex.Message}"); }
     }
@@ -486,7 +492,7 @@ internal static class ShadowWriterPatch
         try
         {
             // Check if audio sharing is enabled
-            if (!AudioBridge.Enabled) return;
+            if (!_patchesEnabled) return;
             if (!AudioBridge.Ready) return;
             if (_initFailed) return;
             if (__result <= 0) return;
@@ -623,6 +629,17 @@ internal static class ShadowWriterPatch
                 {
                     UniLog.Log($"[AudioBridge] Unsupported audio format: {bitsPerSample}-bit");
                     _loggedUnsupported = true;
+                }
+            }
+
+            if (!ShadowBus.Initialized)
+            {
+                if (_shadowBusDisabledTime is null)
+                    _shadowBusDisabledTime = DateTime.Now;
+                else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
+                {
+                    _patchesEnabled = false;
+                    ShadowWriterPatch.UpdateSessionMuting();
                 }
             }
         }
@@ -793,6 +810,8 @@ internal static class ShadowWriterPatch
             UniLog.Log("[AudioBridge] Resetting shadow writer state");
 
         _firstRun = true;
+        _shadowBusDisabledTime = null;
+        _patchesEnabled = true;
         _initFailed = false;
         _loggedFormat = false;
         _loggedByte = false;
