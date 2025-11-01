@@ -30,11 +30,13 @@ public class AudioBridge : BasePlugin
     private static ConfigEntry<MuteTarget>? _muteTarget;
     private static ConfigEntry<bool>? _debugLogging;
 
+    private static bool _actualEnabled;
+
     internal static new ManualLogSource? Log;
 
     internal static bool ShouldMute => Enabled && MuteTarget == MuteTarget.Host;
     internal static MuteTarget MuteTarget => _muteTarget!.Value;
-    internal static bool Enabled => _enabled!.Value;
+    internal static bool Enabled => _actualEnabled;
     internal static bool DebugLogging => _debugLogging!.Value;
     internal static bool Ready
     {
@@ -203,23 +205,34 @@ public class AudioBridge : BasePlugin
     
     private void OnEnabledChanged()
     {
-        UniLog.Log($"[AudioBridge] Enabled changed to: {Enabled}");
+        UniLog.Log($"[AudioBridge] Enabled changed to: {_enabled!.Value}");
 
-        if (!Ready) return;
-
-        if (Enabled)
+        if (!Ready)
         {
-            if (ShadowBus.Initialized) return;
+            _actualEnabled = _enabled.Value;
+            return;
+        }
+
+        if (_enabled.Value)
+        {
+            _actualEnabled = true;
 
             UniLog.Log("[AudioBridge] Enabling audio sharing");
             ShadowWriterPatch.ResetState();
         }
-        else if (ShadowBus.Initialized)
+        else
         {
             UniLog.Log("[AudioBridge] Disabling audio sharing");
 
-            ShadowBus.Shutdown();
-            ShadowWriterPatch.UpdateSessionMuting();
+            if (ShadowBus.Initialized)
+                ShadowBus.Shutdown();
+
+            Task.Run(async () => 
+            { 
+                await Task.Delay(100);
+                _actualEnabled = false;
+                ShadowWriterPatch.UpdateSessionMuting();
+            });
         }
     }
     
@@ -434,7 +447,7 @@ internal static class ShadowWriterPatch
             if (_firstRun)
             {
                 _firstRun = false;
-                if (!ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
                 {
                     _initFailed = true;
                     return;
@@ -443,7 +456,8 @@ internal static class ShadowWriterPatch
             }
 
             // Write audio data BEFORE muting (so renderer gets unmuted audio)
-            ShadowBus.WriteFloats(buffer.AsSpan(offset, floatsRead));
+            if (ShadowBus.Initialized)
+                ShadowBus.WriteFloats(buffer.AsSpan(offset, floatsRead));
             
             // If host should be muted, zero out the buffer AFTER sharing it
             if (AudioBridge.ShouldMute)
@@ -497,8 +511,9 @@ internal static class ShadowWriterPatch
             if (_firstRun)
             {
                 _firstRun = false;
-                if (!ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
                 {
+                    _initFailed = true;
                     return;
                 }
                 UpdateSessionMuting();
@@ -510,9 +525,10 @@ internal static class ShadowWriterPatch
                 // It's already float data in byte form
                 var floatBuffer = new float[bytesRead / sizeof(float)];
                 Buffer.BlockCopy(buffer, offset, floatBuffer, 0, bytesRead);
-                
+
                 // Write to shared memory BEFORE muting
-                ShadowBus.WriteFloats(floatBuffer.AsSpan());
+                if (ShadowBus.Initialized)
+                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
                 if (AudioBridge.ShouldMute)
@@ -544,7 +560,8 @@ internal static class ShadowWriterPatch
                 }
                 
                 // Write to shared memory BEFORE muting
-                ShadowBus.WriteFloats(floatBuffer.AsSpan());
+                if (ShadowBus.Initialized)
+                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
                 if (AudioBridge.ShouldMute)
@@ -577,9 +594,10 @@ internal static class ShadowWriterPatch
                     sample >>= 8; // Sign extend
                     floatBuffer[i] = sample / 8388608.0f; // Convert to -1.0 to 1.0 range
                 }
-                
+
                 // Write to shared memory BEFORE muting
-                ShadowBus.WriteFloats(floatBuffer.AsSpan());
+                if (ShadowBus.Initialized)
+                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
                 
                 // If host should be muted, zero out the original buffer AFTER sharing
                 if (AudioBridge.ShouldMute)
@@ -771,7 +789,9 @@ internal static class ShadowWriterPatch
     
     internal static void ResetState()
     {
-        UniLog.Log("[AudioBridge] Resetting shadow writer state");
+        if (AudioBridge.DebugLogging)
+            UniLog.Log("[AudioBridge] Resetting shadow writer state");
+
         _firstRun = true;
         _initFailed = false;
         _loggedFormat = false;
