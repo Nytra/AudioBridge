@@ -221,8 +221,11 @@ public class AudioBridge : BasePlugin
         {
             UniLog.Log("[AudioBridge] Disabling audio sharing");
 
-            if (ShadowBus.Initialized)
-                ShadowBus.Shutdown();
+            ShadowBus.RunWithLock(() => 
+            {
+                if (ShadowBus.Initialized)
+                    ShadowBus.Shutdown();
+            });
         }
     }
     
@@ -235,8 +238,11 @@ public class AudioBridge : BasePlugin
         // Only process if enabled
         if (Enabled)
         {
-            if (ShadowBus.Initialized)
-                ShadowBus.SendMuteTarget(MuteTarget);
+            ShadowBus.RunWithLock(() => 
+            {
+                if (ShadowBus.Initialized)
+                    ShadowBus.SendMuteTarget(MuteTarget);
+            });
 
             ShadowWriterPatch.UpdateSessionMuting();
         }
@@ -302,6 +308,8 @@ internal static class ShadowBus
 
     public static bool Initialized { get; private set; } = false;
 
+    private static object _lockObj = new();
+
     public static void CreateMessenger()
     {
         if (_messenger is not null)
@@ -358,6 +366,21 @@ internal static class ShadowBus
         Initialized = false;
     }
 
+    public static void RunWithLock(Action act)
+    {
+        lock (_lockObj)
+        {
+            try
+            {
+                act();
+            }
+            catch (Exception ex)
+            {
+                UniLog.Error($"Exception in ShadowBus RunWithLock!\n{ex}");
+            }
+        }
+    }
+
     public static void WriteFloats(ReadOnlySpan<float> src)
     {
         if (_messenger is null)
@@ -396,7 +419,7 @@ internal static class ShadowWriterPatch
     private static bool _isSessionMuted = false;
 
     private static bool _firstRun = true;
-    private static bool _initFailed;
+    private static bool _initFailed = false;
 
     private static string? _capturedSessionId = null;
 
@@ -407,7 +430,8 @@ internal static class ShadowWriterPatch
     private static bool _loggedFormat = false;
     private static int _writeCounter = 0;
 
-    private static bool _patchesEnabled = true;
+    private static bool? _patchesEnabled = null;
+
     private static DateTime? _shadowBusDisabledTime = null;
 
     private const float DEACTIVATE_TIME_SECONDS = 0.5f;
@@ -417,10 +441,13 @@ internal static class ShadowWriterPatch
     {
         try
         {
-            // Check if audio sharing is enabled
-            if (!_patchesEnabled) return;
-            if (_initFailed) return;
             if (!AudioBridge.Ready) return;
+
+            if (_patchesEnabled is null)
+                _patchesEnabled = AudioBridge.Enabled;
+
+            if (_patchesEnabled != true) return;
+            if (_initFailed) return;
             
             var outp = _fOut(__instance);
             var fmt = outp?.ActualOutputFormat;
@@ -439,49 +466,52 @@ internal static class ShadowWriterPatch
             int floatsRead = Math.Max(0, __result / sizeof(float));
             if (floatsRead == 0) return;
 
-            if (_firstRun)
+            ShadowBus.RunWithLock(() => 
             {
-                _firstRun = false;
-                if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                if (_firstRun)
                 {
-                    _initFailed = true;
-                    return;
-                }
-                ShadowWriterPatch.UpdateSessionMuting();
-            }
-
-            // Write audio data BEFORE muting (so renderer gets unmuted audio)
-            if (ShadowBus.Initialized)
-                ShadowBus.WriteFloats(buffer.AsSpan(offset, floatsRead));
-            
-            // If host should be muted, zero out the buffer AFTER sharing it
-            if (AudioBridge.ShouldMute)
-            {
-                Array.Clear(buffer, offset, floatsRead);
-                if (!_loggedBufferMuted && AudioBridge.DebugLogging)
-                {
-                    _loggedBufferMuted = true;
-                    UniLog.Log($"[AudioBridge] Buffer muted");
-                }
-            }
-            
-            // Log periodically
-            _writeCounter++;
-            if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
-            {
-                UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks");
-            }
-
-            if (!ShadowBus.Initialized)
-            {
-                if (_shadowBusDisabledTime is null)
-                    _shadowBusDisabledTime = DateTime.Now;
-                else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
-                {
-                    _patchesEnabled = false;
+                    _firstRun = false;
+                    if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                    {
+                        _initFailed = true;
+                        return;
+                    }
                     ShadowWriterPatch.UpdateSessionMuting();
                 }
-            }
+
+                if (!ShadowBus.Initialized)
+                {
+                    if (_shadowBusDisabledTime is null)
+                        _shadowBusDisabledTime = DateTime.Now;
+                    else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
+                    {
+                        _patchesEnabled = false;
+                        ShadowWriterPatch.UpdateSessionMuting();
+                    }
+                    return;
+                }
+
+                // Write audio data BEFORE muting (so renderer gets unmuted audio)
+                ShadowBus.WriteFloats(buffer.AsSpan(offset, floatsRead));
+
+                // If host should be muted, zero out the buffer AFTER sharing it
+                if (AudioBridge.ShouldMute)
+                {
+                    Array.Clear(buffer, offset, floatsRead);
+                    if (!_loggedBufferMuted && AudioBridge.DebugLogging)
+                    {
+                        _loggedBufferMuted = true;
+                        UniLog.Log($"[AudioBridge] Buffer muted");
+                    }
+                }
+
+                // Log periodically
+                _writeCounter++;
+                if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
+                {
+                    UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks");
+                }
+            });
         }
         catch (Exception ex) { UniLog.Error($"Audio float processing error: {ex.Message}"); }
     }
@@ -491,9 +521,12 @@ internal static class ShadowWriterPatch
     {
         try
         {
-            // Check if audio sharing is enabled
-            if (!_patchesEnabled) return;
             if (!AudioBridge.Ready) return;
+
+            if (_patchesEnabled is null)
+                _patchesEnabled = AudioBridge.Enabled;
+
+            if (_patchesEnabled != true) return;
             if (_initFailed) return;
             if (__result <= 0) return;
             
@@ -514,134 +547,104 @@ internal static class ShadowWriterPatch
             int bytesRead = __result;
             int bitsPerSample = fmt.BitsPerSample;
 
-            if (_firstRun)
+            ShadowBus.RunWithLock(() => 
             {
-                _firstRun = false;
-                if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                if (_firstRun)
                 {
-                    _initFailed = true;
+                    _firstRun = false;
+                    if (!ShadowBus.Initialized && !ShadowBus.Init(fmt.SampleRate, fmt.Channels, _capturedSessionId))
+                    {
+                        _initFailed = true;
+                        return;
+                    }
+                    UpdateSessionMuting();
+                }
+
+                if (!ShadowBus.Initialized)
+                {
+                    if (_shadowBusDisabledTime is null)
+                        _shadowBusDisabledTime = DateTime.Now;
+                    else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
+                    {
+                        _patchesEnabled = false;
+                        ShadowWriterPatch.UpdateSessionMuting();
+                    }
                     return;
                 }
-                UpdateSessionMuting();
-            }
 
-            // Convert bytes to float based on bit depth
-            if (bitsPerSample == 32)
-            {
-                // It's already float data in byte form
-                var floatBuffer = new float[bytesRead / sizeof(float)];
-                Buffer.BlockCopy(buffer, offset, floatBuffer, 0, bytesRead);
+                bool supported = true;
+                float[]? floatBuffer = null;
 
-                // Write to shared memory BEFORE muting
-                if (ShadowBus.Initialized)
-                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
-                
-                // If host should be muted, zero out the original buffer AFTER sharing
-                if (AudioBridge.ShouldMute)
+                // Convert bytes to float based on bit depth
+                if (bitsPerSample == 32)
                 {
-                    Array.Clear(buffer, offset, bytesRead);
-                    if (!_loggedBufferMuted && AudioBridge.DebugLogging)
+                    // It's already float data in byte form
+                    floatBuffer = new float[bytesRead / sizeof(float)];
+                    Buffer.BlockCopy(buffer, offset, floatBuffer, 0, bytesRead);
+                }
+                else if (bitsPerSample == 16)
+                {
+                    // Convert 16-bit PCM to float
+                    int sampleCount = bytesRead / 2; // 2 bytes per sample
+                    floatBuffer = new float[sampleCount];
+
+                    for (int i = 0; i < sampleCount; i++)
                     {
-                        _loggedBufferMuted = true;
-                        UniLog.Log($"[AudioBridge] Buffer muted");
+                        short sample = BitConverter.ToInt16(buffer, offset + i * 2);
+                        floatBuffer[i] = sample / 32768.0f; // Convert to -1.0 to 1.0 range
                     }
                 }
-                
-                _writeCounter++;
-                if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
+                else if (bitsPerSample == 24)
                 {
-                    UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks (32-bit float)");
-                }
-            }
-            else if (bitsPerSample == 16)
-            {
-                // Convert 16-bit PCM to float
-                int sampleCount = bytesRead / 2; // 2 bytes per sample
-                var floatBuffer = new float[sampleCount];
-                
-                for (int i = 0; i < sampleCount; i++)
-                {
-                    short sample = BitConverter.ToInt16(buffer, offset + i * 2);
-                    floatBuffer[i] = sample / 32768.0f; // Convert to -1.0 to 1.0 range
-                }
-                
-                // Write to shared memory BEFORE muting
-                if (ShadowBus.Initialized)
-                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
-                
-                // If host should be muted, zero out the original buffer AFTER sharing
-                if (AudioBridge.ShouldMute)
-                {
-                    Array.Clear(buffer, offset, bytesRead);
-                    if (!_loggedBufferMuted && AudioBridge.DebugLogging)
+                    // Convert 24-bit PCM to float
+                    int sampleCount = bytesRead / 3; // 3 bytes per sample
+                    floatBuffer = new float[sampleCount];
+
+                    for (int i = 0; i < sampleCount; i++)
                     {
-                        _loggedBufferMuted = true;
-                        UniLog.Log($"[AudioBridge] Buffer muted");
+                        int sample = (buffer[offset + i * 3] << 8) |
+                                     (buffer[offset + i * 3 + 1] << 16) |
+                                     (buffer[offset + i * 3 + 2] << 24);
+                        sample >>= 8; // Sign extend
+                        floatBuffer[i] = sample / 8388608.0f; // Convert to -1.0 to 1.0 range
                     }
                 }
-                
-                _writeCounter++;
-                if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
+                else
                 {
-                    UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks (16-bit PCM)");
-                }
-            }
-            else if (bitsPerSample == 24)
-            {
-                // Convert 24-bit PCM to float
-                int sampleCount = bytesRead / 3; // 3 bytes per sample
-                var floatBuffer = new float[sampleCount];
-                
-                for (int i = 0; i < sampleCount; i++)
-                {
-                    int sample = (buffer[offset + i * 3] << 8) | 
-                                 (buffer[offset + i * 3 + 1] << 16) | 
-                                 (buffer[offset + i * 3 + 2] << 24);
-                    sample >>= 8; // Sign extend
-                    floatBuffer[i] = sample / 8388608.0f; // Convert to -1.0 to 1.0 range
-                }
+                    supported = false;
 
-                // Write to shared memory BEFORE muting
-                if (ShadowBus.Initialized)
-                    ShadowBus.WriteFloats(floatBuffer.AsSpan());
-                
-                // If host should be muted, zero out the original buffer AFTER sharing
-                if (AudioBridge.ShouldMute)
-                {
-                    Array.Clear(buffer, offset, bytesRead);
-                    if (!_loggedBufferMuted && AudioBridge.DebugLogging)
+                    // Unsupported format
+                    if (!_loggedUnsupported && AudioBridge.DebugLogging)
                     {
-                        _loggedBufferMuted = true;
-                        UniLog.Log($"[AudioBridge] Buffer muted");
+                        UniLog.Log($"[AudioBridge] Unsupported audio format: {bitsPerSample}-bit");
+                        _loggedUnsupported = true;
                     }
                 }
-                
-                _writeCounter++;
-                if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
-                {
-                    UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks (24-bit PCM)");
-                }
-            }
-            else
-            {
-                // Unsupported format
-                if (!_loggedUnsupported && AudioBridge.DebugLogging)
-                {
-                    UniLog.Log($"[AudioBridge] Unsupported audio format: {bitsPerSample}-bit");
-                    _loggedUnsupported = true;
-                }
-            }
 
-            if (!ShadowBus.Initialized)
-            {
-                if (_shadowBusDisabledTime is null)
-                    _shadowBusDisabledTime = DateTime.Now;
-                else if ((DateTime.Now - _shadowBusDisabledTime).Value.TotalSeconds > DEACTIVATE_TIME_SECONDS)
+                if (supported)
                 {
-                    _patchesEnabled = false;
-                    ShadowWriterPatch.UpdateSessionMuting();
+                    // Write to shared memory BEFORE muting
+                    if (ShadowBus.Initialized)
+                        ShadowBus.WriteFloats(floatBuffer.AsSpan());
+
+                    // If host should be muted, zero out the original buffer AFTER sharing
+                    if (AudioBridge.ShouldMute)
+                    {
+                        Array.Clear(buffer, offset, bytesRead);
+                        if (!_loggedBufferMuted && AudioBridge.DebugLogging)
+                        {
+                            _loggedBufferMuted = true;
+                            UniLog.Log($"[AudioBridge] Buffer muted");
+                        }
+                    }
+
+                    _writeCounter++;
+                    if (_writeCounter % 1000 == 0 && AudioBridge.DebugLogging)
+                    {
+                        UniLog.Log($"[AudioBridge] Processed {_writeCounter} audio chunks ({bitsPerSample}-bit {(bitsPerSample == 32 ? "float" : "pcm")})");
+                    }
                 }
-            }
+            });
         }
         catch (Exception ex) { UniLog.Error($"Audio byte processing error: {ex.Message}"); }
     }
@@ -811,7 +814,7 @@ internal static class ShadowWriterPatch
 
         _firstRun = true;
         _shadowBusDisabledTime = null;
-        _patchesEnabled = true;
+        _patchesEnabled = null;
         _initFailed = false;
         _loggedFormat = false;
         _loggedByte = false;
